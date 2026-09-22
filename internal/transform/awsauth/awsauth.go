@@ -208,7 +208,9 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder, buildCred
 
 		now: time.Now,
 		sign: func(ctx context.Context, creds aws.Credentials, req *http.Request, payloadHash, service, region string, signingTime time.Time) error {
-			return signer.SignHTTP(ctx, creds, req, payloadHash, service, region, signingTime)
+			return signer.SignHTTP(ctx, creds, req, payloadHash, service, region, signingTime, func(o *v4.SignerOptions) {
+				o.DisableURIPathEscaping = service == "s3"
+			})
 		},
 	}, nil
 }
