@@ -37,6 +37,7 @@ import (
 	_ "github.com/ironsh/iron-proxy/internal/transform/annotate"
 	_ "github.com/ironsh/iron-proxy/internal/transform/awsauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/bodycapture"
+	_ "github.com/ironsh/iron-proxy/internal/transform/credmask"
 	_ "github.com/ironsh/iron-proxy/internal/transform/gcpauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/gcpidtoken"
 	_ "github.com/ironsh/iron-proxy/internal/transform/grpc"
