@@ -33,6 +33,11 @@
 //     real credential never reaches the client.
 //   - Swapping (requests): if the store errors, the mask is left in place.
 //     It goes upstream, earns a clean 401, and nothing leaks.
+//   - Swapping happens only inside TLS. Every rule that swaps a real
+//     credential in is compiled with require_tls, whatever the config says,
+//     so a plain-HTTP request keeps its mask and a real credential is never
+//     sent in clear text. Masking (responses) still runs on plain HTTP: it is
+//     the safe direction.
 //
 // iron-proxy never decompresses bodies, so this transform narrows
 // Accept-Encoding on the requests whose responses it must read, and decodes
@@ -132,7 +137,8 @@ type oauthProvider struct {
 	kind       string
 	field      string
 	maskPrefix string
-	rules      []hostmatch.Rule
+	rules      []hostmatch.Rule // as configured: response masking
+	swapRules  []hostmatch.Rule // require_tls forced on: request swap
 }
 
 // CredMask is the transform.
@@ -141,7 +147,7 @@ type CredMask struct {
 	enforceSource bool
 	logger        *slog.Logger
 
-	githubConsume []hostmatch.Rule // nil when github is not configured
+	githubConsume []hostmatch.Rule // require_tls forced on; nil when github is not configured
 	githubIssue   []hostmatch.Rule
 	oauth         []oauthProvider
 }
@@ -178,7 +184,7 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 			return nil, errors.New("credential_mask: github needs both consume_rules and issue_rules")
 		}
 		var err error
-		if m.githubConsume, err = hostmatch.CompileRules(c.GitHub.ConsumeRules, "credential_mask github.consume_rules"); err != nil {
+		if m.githubConsume, err = hostmatch.CompileRules(withRequireTLS(c.GitHub.ConsumeRules), "credential_mask github.consume_rules"); err != nil {
 			return nil, err
 		}
 		if m.githubIssue, err = hostmatch.CompileRules(c.GitHub.IssueRules, "credential_mask github.issue_rules"); err != nil {
@@ -201,17 +207,33 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		if err != nil {
 			return nil, err
 		}
+		swapRules, err := hostmatch.CompileRules(withRequireTLS(p.Rules), ctx)
+		if err != nil {
+			return nil, err
+		}
 		field := p.Field
 		if field == "" {
 			field = "refresh_token"
 		}
-		m.oauth = append(m.oauth, oauthProvider{kind: p.Kind, field: field, maskPrefix: p.MaskPrefix, rules: rules})
+		m.oauth = append(m.oauth, oauthProvider{kind: p.Kind, field: field, maskPrefix: p.MaskPrefix, rules: rules, swapRules: swapRules})
 	}
 
 	if m.githubConsume == nil && len(m.oauth) == 0 {
 		return nil, errors.New("credential_mask: configure github and/or oauth_refresh")
 	}
 	return m, nil
+}
+
+// withRequireTLS returns a copy of rules with require_tls forced on. Every
+// rule that swaps a real credential into a request goes through it, so the
+// guard cannot be configured away.
+func withRequireTLS(rules []hostmatch.RuleConfig) []hostmatch.RuleConfig {
+	out := make([]hostmatch.RuleConfig, len(rules))
+	for i, rc := range rules {
+		rc.RequireTLS = true
+		out[i] = rc
+	}
+	return out
 }
 
 func (m *CredMask) Name() string { return "credential_mask" }
@@ -251,8 +273,11 @@ func (m *CredMask) TransformRequest(_ context.Context, tctx *transform.Transform
 	}
 
 	if p := m.matchingOAuth(req); p != nil {
+		// Asked for uncompressed on plain HTTP too: the response is still masked.
 		req.Header.Set("Accept-Encoding", "identity")
-		m.swapOAuthRefresh(tctx, req, p)
+		if hostmatch.MatchAnyRule(p.swapRules, req) {
+			m.swapOAuthRefresh(tctx, req, p)
+		}
 	}
 
 	return cont, nil
