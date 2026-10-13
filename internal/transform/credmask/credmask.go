@@ -17,7 +17,12 @@
 //     the real token before the request goes upstream. Only headers are
 //     touched, so large request bodies (a big `git push`) still stream.
 //  3. Echo re-masking (response). If a response body echoes the real token
-//     we swapped in, it is re-masked before it reaches the client.
+//     we swapped in, it is re-masked before it reaches the client. This is
+//     best effort, a backstop rather than a guarantee: only text-like
+//     bodies up to echoMaxBytes are scanned. Larger bodies, SSE streams and
+//     binary types (git packfiles) pass through unscanned. Failing closed
+//     on those would block every git fetch and clone, and GitHub does not
+//     echo OAuth tokens back in responses.
 //
 // OAuth refresh tokens (Claude, Codex), configured per provider:
 //
@@ -115,6 +120,7 @@ const githubAuthKind = "github:access_token"
 // Echo re-masking only scans small, text-like responses. Packfiles and other
 // large/binary bodies won't echo a token, and reading them would buffer them
 // in memory. text/event-stream is excluded so streams are never buffered.
+// Anything skipped is forwarded unscanned, not rejected: see the package doc.
 const echoMaxBytes = 256 * 1024
 
 var echoTextContentTypes = []string{"application/json", "text/", "application/x-www-form-urlencoded"}
