@@ -215,6 +215,44 @@ func TestGitHubIssuanceStoreFailureFailsClosed(t *testing.T) {
 	require.NotContains(t, string(readAll(t, res.Response.Body)), realGitHub)
 }
 
+// A token GitHub issues with a prefix we don't recognise is still a real
+// credential: the flow must fail closed rather than pass it through.
+func TestGitHubIssuanceUnknownPrefix(t *testing.T) {
+	const unknown = "ghx_NEWprefixTOKEN0123456789abcdefghij"
+	tests := []struct {
+		name       string
+		ctype      string
+		body       string
+		wantReject bool
+	}{
+		{name: "json access_token", ctype: "application/json", body: `{"access_token":"` + unknown + `"}`, wantReject: true},
+		{name: "json refresh_token", ctype: "application/json", body: `{"access_token":"` + realGitHub + `","refresh_token":"` + unknown + `"}`, wantReject: true},
+		{name: "form access_token", ctype: "application/x-www-form-urlencoded", body: "access_token=" + unknown + "&token_type=bearer", wantReject: true},
+		{name: "json empty refresh_token is not a token", ctype: "application/json", body: `{"access_token":"` + realGitHub + `","refresh_token":""}`, wantReject: false},
+		{name: "json null refresh_token is not a token", ctype: "application/json", body: `{"access_token":"` + realGitHub + `","refresh_token":null}`, wantReject: false},
+		{name: "form empty refresh_token is not a token", ctype: "application/x-www-form-urlencoded", body: "access_token=" + realGitHub + "&refresh_token=", wantReject: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := newTestTransform(t)
+			req := newReq("POST", issuePath, nil)
+			resp := newResp(req, 200, http.Header{"Content-Type": {tc.ctype}}, []byte(tc.body))
+
+			res, err := m.TransformResponse(context.Background(), tctx(), req, resp)
+			require.NoError(t, err)
+			if tc.wantReject {
+				require.Equal(t, transform.ActionReject, res.Action)
+				require.Equal(t, http.StatusInternalServerError, res.Response.StatusCode)
+				require.NotContains(t, string(readAll(t, res.Response.Body)), unknown)
+				return
+			}
+			require.Equal(t, transform.ActionContinue, res.Action)
+			require.NotContains(t, string(readAll(t, resp.Body)), realGitHub)
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // GitHub consumption
 // ---------------------------------------------------------------------------

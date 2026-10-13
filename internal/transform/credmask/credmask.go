@@ -455,8 +455,13 @@ func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *htt
 		}
 		for _, field := range githubTokenFields {
 			val, ok := obj[field].(string)
-			if !ok || !hasAnyPrefix(val, githubTokenPrefixes) {
+			if !ok || val == "" {
 				continue
+			}
+			if !hasAnyPrefix(val, githubTokenPrefixes) {
+				// There IS a token, but with a prefix we don't know. Passing
+				// it through would leak it, so abort instead.
+				return m.abort(tctx, req, "github:issue", fmt.Sprintf("%s has unexpected shape (unknown prefix)", field))
 			}
 			mask, err := m.store.Tokenize(val, "github:"+field, source, "")
 			if err != nil {
@@ -478,8 +483,11 @@ func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *htt
 		}
 		for _, field := range githubTokenFields {
 			val := form.Get(field)
-			if !hasAnyPrefix(val, githubTokenPrefixes) {
+			if val == "" {
 				continue
+			}
+			if !hasAnyPrefix(val, githubTokenPrefixes) {
+				return m.abort(tctx, req, "github:issue", fmt.Sprintf("%s has unexpected shape (unknown prefix)", field))
 			}
 			mask, err := m.store.Tokenize(val, "github:"+field, source, "")
 			if err != nil {
