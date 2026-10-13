@@ -184,7 +184,7 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 			return nil, errors.New("credential_mask: github needs both consume_rules and issue_rules")
 		}
 		var err error
-		if m.githubConsume, err = hostmatch.CompileRules(withRequireTLS(c.GitHub.ConsumeRules), "credential_mask github.consume_rules"); err != nil {
+		if m.githubConsume, err = hostmatch.CompileRulesAllowRequireTLS(withRequireTLS(c.GitHub.ConsumeRules), "credential_mask github.consume_rules"); err != nil {
 			return nil, err
 		}
 		if m.githubIssue, err = hostmatch.CompileRules(c.GitHub.IssueRules, "credential_mask github.issue_rules"); err != nil {
@@ -207,7 +207,7 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		if err != nil {
 			return nil, err
 		}
-		swapRules, err := hostmatch.CompileRules(withRequireTLS(p.Rules), ctx)
+		swapRules, err := hostmatch.CompileRulesAllowRequireTLS(withRequireTLS(p.Rules), ctx)
 		if err != nil {
 			return nil, err
 		}
