@@ -55,21 +55,21 @@ func TestResolveEnforcesSource(t *testing.T) {
 	mask, err := s.Tokenize(realGitHub, "github:access_token", "10.0.0.5", "")
 	require.NoError(t, err)
 
-	real, ok, err := s.Resolve(mask, "10.0.0.5", true)
+	real, ok, err := s.Resolve(mask, "github:access_token", "10.0.0.5", true)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, realGitHub, real)
 
-	_, ok, err = s.Resolve(mask, "10.0.0.9", true)
+	_, ok, err = s.Resolve(mask, "github:access_token", "10.0.0.9", true)
 	require.NoError(t, err)
 	require.False(t, ok, "mask presented from another source must not resolve")
 
-	real, ok, err = s.Resolve(mask, "10.0.0.9", false)
+	real, ok, err = s.Resolve(mask, "github:access_token", "10.0.0.9", false)
 	require.NoError(t, err)
 	require.True(t, ok, "with enforcement off any source resolves")
 	require.Equal(t, realGitHub, real)
 
-	_, ok, err = s.Resolve("gho_notOneOfOurs", "10.0.0.5", true)
+	_, ok, err = s.Resolve("gho_notOneOfOurs", "github:access_token", "10.0.0.5", true)
 	require.NoError(t, err)
 	require.False(t, ok)
 }
@@ -91,7 +91,7 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 
 	s2, err := Open(dir)
 	require.NoError(t, err)
-	real, ok, err := s2.Resolve(mask, "10.0.0.5", true)
+	real, ok, err := s2.Resolve(mask, "github:access_token", "10.0.0.5", true)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, realGitHub, real)
@@ -120,7 +120,7 @@ func TestCiphertextIsBoundToItsMask(t *testing.T) {
 	s2, err := Open(dir)
 	require.NoError(t, err)
 	for _, m := range []string{maskA, maskB} {
-		_, _, err := s2.Resolve(m, "10.0.0.5", true)
+		_, _, err := s2.Resolve(m, "k", "10.0.0.5", true)
 		require.ErrorIs(t, err, ErrStore, "a ciphertext moved to another mask must not decrypt")
 	}
 }

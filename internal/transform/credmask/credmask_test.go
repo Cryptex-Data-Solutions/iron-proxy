@@ -138,7 +138,7 @@ func TestGitHubIssuanceJSONIsMasked(t *testing.T) {
 	require.Len(t, mask, len(realGitHub))
 	require.Equal(t, "repo", obj["scope"])
 
-	real, ok, err := store.Resolve(mask, clientIP, true)
+	real, ok, err := store.Resolve(mask, "github:access_token", clientIP, true)
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.Equal(t, realGitHub, real)

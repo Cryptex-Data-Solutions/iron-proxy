@@ -212,11 +212,17 @@ func (s *Store) Tokenize(secret, kind, source, maskPrefix string) (string, error
 	return mask, nil
 }
 
-// Resolve returns the real secret for mask. ok=false means "not ours, or
-// minted for a different source while enforceSource is on": the caller
-// leaves the value alone and the upstream rejects it. An error means
-// decryption failed, which the caller must also treat as a failure.
-func (s *Store) Resolve(mask, source string, enforceSource bool) (string, bool, error) {
+// Resolve returns the real secret for mask. ok=false means "not ours, minted
+// as a different kind, or minted for a different source while enforceSource
+// is on": the caller leaves the value alone and the upstream rejects it. An
+// error means decryption failed, which the caller must also treat as a
+// failure.
+//
+// kind is the credential kind the caller is about to send (for example
+// "github:access_token"). It must match the kind the mask was minted as, so
+// a mask for one provider's credential can never be swapped into a request
+// to another provider.
+func (s *Store) Resolve(mask, kind, source string, enforceSource bool) (string, bool, error) {
 	if mask == "" {
 		return "", false, nil
 	}
@@ -224,6 +230,9 @@ func (s *Store) Resolve(mask, source string, enforceSource bool) (string, bool, 
 	rec, found := s.byMask[mask]
 	s.mu.Unlock()
 	if !found {
+		return "", false, nil
+	}
+	if rec.Kind != kind {
 		return "", false, nil
 	}
 	if enforceSource && rec.Source != source {

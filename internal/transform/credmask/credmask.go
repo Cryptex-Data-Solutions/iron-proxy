@@ -107,6 +107,11 @@ var githubTokenPrefixes = []string{"gho_", "ghu_", "ghs_", "ghr_", "ghp_"}
 // githubTokenFields are the issuance body fields that may hold a token.
 var githubTokenFields = []string{"access_token", "refresh_token"}
 
+// githubAuthKind is the only kind swapped into an Authorization header: a
+// masked GitHub access token. A GitHub refresh token, or another provider's
+// credential, is never sent there.
+const githubAuthKind = "github:access_token"
+
 // Echo re-masking only scans small, text-like responses. Packfiles and other
 // large/binary bodies won't echo a token, and reading them would buffer them
 // in memory. text/event-stream is excluded so streams are never buffered.
@@ -300,7 +305,7 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 	var newAuth string
 	switch strings.ToLower(scheme) {
 	case "token", "bearer":
-		real, found, err := m.store.Resolve(value, source, m.enforceSource)
+		real, found, err := m.store.Resolve(value, githubAuthKind, source, m.enforceSource)
 		if err != nil {
 			// Fail safe: leave the mask; upstream answers 401, nothing leaks.
 			m.logger.Error("credential_mask: store error resolving github mask, header left unchanged", slog.String("error", err.Error()))
@@ -322,7 +327,7 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 		if !ok {
 			return
 		}
-		real, found, err := m.store.Resolve(pw, source, m.enforceSource)
+		real, found, err := m.store.Resolve(pw, githubAuthKind, source, m.enforceSource)
 		if err != nil {
 			m.logger.Error("credential_mask: store error resolving github basic-auth mask, header left unchanged", slog.String("error", err.Error()))
 			tctx.Annotate("resolve_error", "github")
@@ -361,7 +366,7 @@ func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.
 	if !ok || val == "" {
 		return
 	}
-	real, found, err := m.store.Resolve(val, sourceOf(req), m.enforceSource)
+	real, found, err := m.store.Resolve(val, p.kind, sourceOf(req), m.enforceSource)
 	if err != nil {
 		// Fail safe: leave the mask; the refresh is rejected and the user re-auths.
 		m.logger.Error("credential_mask: store error resolving refresh mask, left unchanged",
