@@ -23,6 +23,10 @@
 //     binary types (git packfiles) pass through unscanned. Failing closed
 //     on those would block every git fetch and clone, and GitHub does not
 //     echo OAuth tokens back in responses.
+//  4. Refresh (request). GitHub App user tokens expire and are refreshed
+//     by POSTing the refresh_token (masked at issuance, step 1) back to the
+//     issuance endpoint. The mask is swapped for the real refresh token in
+//     the query string or a form/JSON body, inside TLS only.
 //
 // OAuth refresh tokens (Claude, Codex), configured per provider:
 //
@@ -159,7 +163,8 @@ type CredMask struct {
 	logger        *slog.Logger
 
 	githubConsume []hostmatch.Rule // require_tls forced on; nil when github is not configured
-	githubIssue   []hostmatch.Rule
+	githubIssue   []hostmatch.Rule // as configured: response masking
+	githubRefresh []hostmatch.Rule // issue rules with require_tls forced on: refresh_token swap
 	oauth         []oauthProvider
 }
 
@@ -199,6 +204,9 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 			return nil, err
 		}
 		if m.githubIssue, err = hostmatch.CompileRules(c.GitHub.IssueRules, "credential_mask github.issue_rules"); err != nil {
+			return nil, err
+		}
+		if m.githubRefresh, err = hostmatch.CompileRulesAllowRequireTLS(withRequireTLS(c.GitHub.IssueRules), "credential_mask github.issue_rules"); err != nil {
 			return nil, err
 		}
 	}
@@ -277,6 +285,10 @@ func (m *CredMask) TransformRequest(_ context.Context, tctx *transform.Transform
 	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubIssue, req) {
 		// We must read the issuance response, so ask for it uncompressed.
 		req.Header.Set("Accept-Encoding", "identity")
+	}
+
+	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubRefresh, req) {
+		m.swapGitHubRefresh(tctx, req)
 	}
 
 	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubConsume, req) {
@@ -394,6 +406,101 @@ func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.
 	req.ContentLength = int64(len(out))
 	req.Header.Set("Content-Length", strconv.Itoa(len(out)))
 	tctx.Annotate("swapped", p.kind)
+}
+
+// githubRefreshKind is the kind swapped back into a GitHub token refresh
+// (grant_type=refresh_token). GitHub documents the refresh_token as a query
+// parameter; clients also send it in a form or JSON body. All three are
+// handled. The query is safe to rewrite: the audit log records the path
+// only, never the query.
+const githubRefreshKind = "github:refresh_token"
+
+// swapGitHubRefresh replaces a masked GitHub refresh token with the real one
+// in a refresh request to the issuance endpoint. Without it, GitHub App user
+// tokens (which expire) could never be refreshed through the proxy.
+func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http.Request) {
+	source := sourceOf(req)
+	swapped := false
+
+	// 1. Query string.
+	query := req.URL.Query()
+	if mask := query.Get("refresh_token"); mask != "" {
+		real, found, err := m.store.Resolve(mask, githubRefreshKind, source, m.enforceSource)
+		if err != nil {
+			m.logger.Error("credential_mask: store error resolving github refresh mask in query, left unchanged", slog.String("error", err.Error()))
+			tctx.Annotate("resolve_error", githubRefreshKind)
+			return
+		}
+		if found {
+			query.Set("refresh_token", real)
+			req.URL.RawQuery = query.Encode()
+			swapped = true
+		}
+	}
+
+	// 2. Body: form-encoded or JSON.
+	if req.Body != nil && req.Header.Get("Content-Encoding") == "" {
+		data, err := io.ReadAll(req.Body)
+		if err == nil && len(data) > 0 {
+			out, bodySwapped, err := m.swapGitHubRefreshInBody(req.Header.Get("Content-Type"), data, source)
+			if err != nil {
+				m.logger.Error("credential_mask: swapping github refresh mask in body failed, left unchanged", slog.String("error", err.Error()))
+				tctx.Annotate("resolve_error", githubRefreshKind)
+				return
+			}
+			if bodySwapped {
+				req.Body = transform.NewBufferedBodyFromBytes(out)
+				req.ContentLength = int64(len(out))
+				req.Header.Set("Content-Length", strconv.Itoa(len(out)))
+				swapped = true
+			}
+		}
+	}
+
+	if swapped {
+		tctx.Annotate("swapped", githubRefreshKind)
+	}
+}
+
+// swapGitHubRefreshInBody returns the body with a masked refresh_token
+// replaced by the real one. swapped=false means the body had no mask of
+// ours and must be left as it was.
+func (m *CredMask) swapGitHubRefreshInBody(contentType string, data []byte, source string) ([]byte, bool, error) {
+	if strings.Contains(contentType, "application/json") || bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+		obj, ok := parseJSONObject(data)
+		if !ok {
+			return nil, false, nil
+		}
+		mask, ok := obj["refresh_token"].(string)
+		if !ok || mask == "" {
+			return nil, false, nil
+		}
+		real, found, err := m.store.Resolve(mask, githubRefreshKind, source, m.enforceSource)
+		if err != nil || !found {
+			return nil, false, err
+		}
+		obj["refresh_token"] = real
+		out, err := encodeJSON(obj)
+		if err != nil {
+			return nil, false, err
+		}
+		return out, true, nil
+	}
+
+	form, err := url.ParseQuery(string(data))
+	if err != nil {
+		return nil, false, nil
+	}
+	mask := form.Get("refresh_token")
+	if mask == "" {
+		return nil, false, nil
+	}
+	real, found, err := m.store.Resolve(mask, githubRefreshKind, source, m.enforceSource)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	form.Set("refresh_token", real)
+	return []byte(form.Encode()), true, nil
 }
 
 // narrowAcceptEncodingToGzip keeps gzip if the client offered it, otherwise

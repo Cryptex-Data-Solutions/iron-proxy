@@ -119,6 +119,12 @@ func TestTLS_ConfigCannotTurnOffTheSwapGuard(t *testing.T) {
 	for _, r := range m.githubConsume {
 		require.True(t, r.RequireTLS, "github consume rules must require TLS")
 	}
+	for _, r := range m.githubRefresh {
+		require.True(t, r.RequireTLS, "github refresh swap rules must require TLS")
+	}
+	for _, r := range m.githubIssue {
+		require.False(t, r.RequireTLS, "github issuance masking rules keep the configured value")
+	}
 	for _, r := range m.oauth[0].swapRules {
 		require.True(t, r.RequireTLS, "oauth swap rules must require TLS")
 	}
