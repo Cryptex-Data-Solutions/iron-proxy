@@ -394,6 +394,61 @@ func TestEchoSkipsEventStreamAndBinary(t *testing.T) {
 	}
 }
 
+// Echo scanning must never buffer a body it cannot first prove is small:
+// the pipeline's BufferedBody reads the whole body on the first Read.
+func TestEchoSizeBounds(t *testing.T) {
+	small := []byte(`{"token":"` + realGitHub + `"}`)
+	large := append(bytes.Repeat([]byte(" "), echoMaxBytes), small...)
+
+	tests := []struct {
+		name          string
+		body          []byte
+		unknownLength bool // ContentLength -1, as for chunked or HTTP/2
+		preBuffered   bool // an earlier transform already read the body
+		wantRemasked  bool
+		wantBuffered  bool
+	}{
+		{name: "known small length", body: small, wantRemasked: true, wantBuffered: true},
+		{name: "known large length", body: large, wantRemasked: false, wantBuffered: false},
+		{name: "unknown length is not read", body: small, unknownLength: true, wantRemasked: false, wantBuffered: false},
+		{name: "unknown length but already buffered small", body: small, unknownLength: true, preBuffered: true, wantRemasked: true, wantBuffered: true},
+		{name: "unknown length but already buffered large", body: large, unknownLength: true, preBuffered: true, wantRemasked: false, wantBuffered: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, store := newTestTransform(t)
+			req, mask := swappedGitHubRequest(t, m, store)
+			resp := newResp(req, 200, http.Header{"Content-Type": {"application/json"}}, tc.body)
+			if tc.unknownLength {
+				resp.ContentLength = -1
+			}
+			if tc.preBuffered {
+				bb := transform.RequireBufferedBody(resp.Body)
+				_, err := io.ReadAll(bb)
+				require.NoError(t, err)
+				bb.Reset()
+			}
+
+			_, err := m.TransformResponse(context.Background(), tctx(), req, resp)
+			require.NoError(t, err)
+
+			bb := transform.RequireBufferedBody(resp.Body)
+			if !tc.wantBuffered {
+				require.Equal(t, -1, bb.Len(), "body must not be buffered")
+				return
+			}
+			out := string(readAll(t, resp.Body))
+			if tc.wantRemasked {
+				require.NotContains(t, out, realGitHub)
+				require.Contains(t, out, mask)
+			} else {
+				require.Contains(t, out, realGitHub)
+			}
+		})
+	}
+}
+
 func TestEchoUnchangedBodyIsLeftAlone(t *testing.T) {
 	m, store := newTestTransform(t)
 	req, _ := swappedGitHubRequest(t, m, store)

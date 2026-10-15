@@ -19,8 +19,9 @@
 //  3. Echo re-masking (response). If a response body echoes the real token
 //     we swapped in, it is re-masked before it reaches the client. This is
 //     best effort, a backstop rather than a guarantee: only text-like
-//     bodies up to echoMaxBytes are scanned. Larger bodies, SSE streams and
-//     binary types (git packfiles) pass through unscanned. Failing closed
+//     bodies known to be at most echoMaxBytes are scanned. Larger bodies,
+//     bodies of unknown length (chunked, HTTP/2 without Content-Length),
+//     SSE streams and binary types (git packfiles) pass through unscanned. Failing closed
 //     on those would block every git fetch and clone, and GitHub does not
 //     echo OAuth tokens back in responses.
 //  4. Refresh (request). GitHub App user tokens expire and are refreshed
@@ -639,7 +640,21 @@ func (m *CredMask) remaskGitHubEcho(tctx *transform.TransformContext, req *http.
 	if strings.HasPrefix(ctype, "text/event-stream") || !containsAny(ctype, echoTextContentTypes) {
 		return
 	}
-	if resp.ContentLength > echoMaxBytes {
+	// The body must be known to be small BEFORE it is read: the pipeline's
+	// BufferedBody reads the whole body into memory on the first Read, so a
+	// limited read would not bound memory. The size is known from
+	// Content-Length, or from Len() if an earlier transform already read it.
+	// Chunked and HTTP/2 responses without Content-Length are skipped.
+	size := resp.ContentLength
+	if size < 0 && resp.Body != nil {
+		size = int64(transform.RequireBufferedBody(resp.Body).Len())
+	}
+	if size < 0 {
+		tctx.Annotate("echo_skipped", "unknown-length")
+		return
+	}
+	if size > echoMaxBytes {
+		tctx.Annotate("echo_skipped", "too-large")
 		return
 	}
 	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
