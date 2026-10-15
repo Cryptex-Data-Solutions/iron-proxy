@@ -37,6 +37,7 @@ import (
 	_ "github.com/ironsh/iron-proxy/internal/transform/annotate"
 	_ "github.com/ironsh/iron-proxy/internal/transform/awsauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/bodycapture"
+	_ "github.com/ironsh/iron-proxy/internal/transform/credmask"
 	_ "github.com/ironsh/iron-proxy/internal/transform/gcpauth"
 	_ "github.com/ironsh/iron-proxy/internal/transform/gcpidtoken"
 	_ "github.com/ironsh/iron-proxy/internal/transform/grpc"
@@ -712,6 +713,9 @@ func newReloadFunc(configPath string, holder *transform.PipelineHolder, mcpHolde
 
 // buildPipeline creates a transform.Pipeline from config transforms.
 func buildPipeline(transforms []config.Transform, bodyLimits transform.BodyLimits, logger *slog.Logger) (*transform.Pipeline, error) {
+	if err := validateTransformOrder(transforms); err != nil {
+		return nil, err
+	}
 	var transformers []transform.Transformer
 	for _, tc := range transforms {
 		factory, err := transform.Lookup(tc.Name)
@@ -725,6 +729,25 @@ func buildPipeline(transforms []config.Transform, bodyLimits transform.BodyLimit
 		transformers = append(transformers, t)
 	}
 	return transform.NewPipeline(transformers, bodyLimits, logger), nil
+}
+
+// validateTransformOrder rejects a body_capture placed after a
+// credential_mask. Request transforms run in config order, and
+// credential_mask swaps a real refresh token into the request body, so a
+// later body_capture would write that real token to the audit log. Any
+// such order is rejected, whatever the rules, so the check cannot be
+// defeated by rules that overlap in ways we did not foresee.
+func validateTransformOrder(transforms []config.Transform) error {
+	credMaskIndex := -1
+	for i, tc := range transforms {
+		if tc.Name == "credential_mask" && credMaskIndex == -1 {
+			credMaskIndex = i
+		}
+		if tc.Name == "body_capture" && credMaskIndex != -1 {
+			return fmt.Errorf("transforms[%d]: body_capture must come before credential_mask (transforms[%d]): after it, body_capture would record real credentials in the audit log", i, credMaskIndex)
+		}
+	}
+	return nil
 }
 
 func envOrDefault(key, def string) string {
