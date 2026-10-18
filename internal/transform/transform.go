@@ -91,6 +91,28 @@ type TransformContext struct {
 	// annotations is written by transforms via Annotate and read by the pipeline
 	// to build TransformTrace. Not exported — transforms use the Annotate method.
 	annotations map[string]any
+
+	// credentialsInjectedBy names each transform that put a credential the
+	// proxy holds into this request (for example credential_mask swapping a
+	// mask for the real token, or aws_auth re-signing). A later transform can
+	// use it to tell a request the proxy authorized from one the client
+	// authorized on its own. Written via MarkCredentialInjected. The context
+	// is created per request, so this never carries over to another request.
+	credentialsInjectedBy []string
+}
+
+// MarkCredentialInjected records that the named transform put a credential
+// the proxy holds into this request. Call it only after the credential is
+// actually in the request.
+func (tctx *TransformContext) MarkCredentialInjected(by string) {
+	tctx.credentialsInjectedBy = append(tctx.credentialsInjectedBy, by)
+}
+
+// CredentialsInjectedBy returns the transforms that have put a proxy-held
+// credential into this request so far, in pipeline order. Empty means the
+// request carries only what the client sent.
+func (tctx *TransformContext) CredentialsInjectedBy() []string {
+	return tctx.credentialsInjectedBy
 }
 
 // TunnelInfo carries metadata from the CONNECT/SOCKS5 tunnel that established
