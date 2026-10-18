@@ -272,6 +272,9 @@ func (h *HMACSign) TransformRequest(ctx context.Context, tctx *transform.Transfo
 
 	req.Body = transform.NewBufferedBodyFromBytes(body)
 	tctx.Annotate("injected", injected)
+	if len(injected) > 0 {
+		tctx.MarkCredentialInjected(h.Name())
+	}
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
