@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -201,4 +202,128 @@ func TestSelectiveIntercept_OffByDefault(t *testing.T) {
 	intercepted, body := s.get(t, "localhost:"+port, "localhost", "/all")
 	require.True(t, intercepted, "with no lists every host is decrypted, as before")
 	require.Equal(t, "echo /all\n", body)
+}
+
+// startSelectiveHTTPSListener builds a selective proxy (no tunnel listener)
+// and serves its direct HTTPS listener on 127.0.0.1:0. upstreamHandler
+// answers decrypted requests; tunnelled ones go to the echo server.
+func startSelectiveHTTPSListener(t *testing.T, intercept []string, upstreamHandler http.Handler, echo string) (*Proxy, string, *x509.Certificate) {
+	t.Helper()
+	_, echoPort, err := net.SplitHostPort(echo)
+	require.NoError(t, err)
+
+	caCert, caKey := generateTestCA(t)
+	cache, err := certcache.NewFromCA(caCert, caKey, 100, 72*time.Hour)
+	require.NoError(t, err)
+	al, err := allowlist.New([]string{"localhost", "allowed.example"}, nil)
+	require.NoError(t, err)
+
+	p := New(Options{
+		HTTPAddr:       "127.0.0.1:0",
+		HTTPSAddr:      "127.0.0.1:0",
+		CertCache:      cache,
+		Pipeline:       transform.NewPipelineHolder(transform.NewPipeline([]transform.Transformer{al}, transform.BodyLimits{}, testLogger())),
+		Logger:         testLogger(),
+		InterceptHosts: intercept,
+	})
+	p.sniUpstreamPort = echoPort
+
+	mitmUpstream := httptest.NewTLSServer(upstreamHandler)
+	t.Cleanup(mitmUpstream.Close)
+	upstreamAddr := mitmUpstream.Listener.Addr().String()
+	p.transport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, upstreamAddr)
+		},
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.serveHTTPSSelectiveOn(ln) }() // returns http.ErrServerClosed on Shutdown
+	return p, ln.Addr().String(), caCert
+}
+
+// dialDirect handshakes with the direct HTTPS listener as sni and reports
+// whether the proxy decrypted (leaf signed by the proxy CA).
+func dialDirect(t *testing.T, addr, sni string, caCert *x509.Certificate) (*tls.Conn, bool) {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{ServerName: sni, InsecureSkipVerify: true})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	leaf := conn.ConnectionState().PeerCertificates[0]
+	return conn, leaf.CheckSignatureFrom(caCert) == nil
+}
+
+func TestSelectiveIntercept_DirectHTTPSListener(t *testing.T) {
+	echo, _ := startEchoTLSServer(t)
+	_, addr, caCert := startSelectiveHTTPSListener(t, []string{"allowed.example"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "decrypted")
+	}), echo)
+
+	conn, intercepted := dialDirect(t, addr, "allowed.example", caCert)
+	require.True(t, intercepted)
+	_, err := fmt.Fprint(conn, "GET /a HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n")
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "decrypted", string(body))
+
+	conn, intercepted = dialDirect(t, addr, "localhost", caCert)
+	require.False(t, intercepted, "unlisted host is tunnelled to the echo server")
+	_, err = fmt.Fprint(conn, "GET /b HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	require.NoError(t, err)
+	resp, err = http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	body, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "echo /b\n", string(body))
+}
+
+// Shutdown drains a decrypted request that is in flight on the direct
+// HTTPS listener, as plain mitm mode does, instead of cutting it off.
+func TestSelectiveIntercept_ShutdownDrainsInFlightRequest(t *testing.T) {
+	echo, _ := startEchoTLSServer(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	p, addr, caCert := startSelectiveHTTPSListener(t, []string{"allowed.example"}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-release
+		_, _ = fmt.Fprint(w, "finished")
+	}), echo)
+
+	conn, intercepted := dialDirect(t, addr, "allowed.example", caCert)
+	require.True(t, intercepted)
+	_, err := fmt.Fprint(conn, "GET /slow HTTP/1.1\r\nHost: allowed.example\r\nConnection: close\r\n\r\n")
+	require.NoError(t, err)
+	<-started
+
+	shutdownDone := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shutdownDone <- p.Shutdown(ctx)
+	}()
+
+	select {
+	case <-shutdownDone:
+		t.Fatal("Shutdown returned while a decrypted request was still in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "finished", string(body), "the in-flight request completes")
+
+	select {
+	case err := <-shutdownDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after the request finished")
+	}
 }

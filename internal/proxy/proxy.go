@@ -251,8 +251,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	errHTTP := p.httpServer.Shutdown(ctx)
 
 	var errHTTPS error
-	if p.tlsMode == config.TLSModeSNIOnly || p.selectiveIntercept() {
-		// Both run their own accept loop on a raw listener, not httpsServer.
+	if p.tlsMode == config.TLSModeSNIOnly {
 		if p.tlsListener != nil {
 			_ = p.tlsListener.Close()
 		}

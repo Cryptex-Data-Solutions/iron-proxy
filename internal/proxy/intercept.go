@@ -3,14 +3,13 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 )
 
 // Selective interception (tls.intercept / tls.intercept_exclude).
@@ -20,6 +19,16 @@ import (
 // inside them, and tunnels the rest exactly as sni-only mode does: the
 // pipeline runs on the SNI alone (so the allowlist still applies) and the
 // bytes are passed through undecrypted.
+//
+// The decision is always made on the ClientHello SNI, never on the CONNECT
+// target. The tunnel path dials the SNI host, so deciding on the target
+// would let a client CONNECT to a tunnelled host and then send a
+// ClientHello for an intercepted one, skipping every transform that host
+// needs.
+//
+// Lifecycles: decrypted connections on the HTTPS listener are served by
+// httpsServer, so Shutdown drains them like plain mitm mode. Tunnelled
+// connections close when shutdownCtx is cancelled, like sni-only mode.
 
 // selectiveIntercept reports whether an intercept list is configured.
 func (p *Proxy) selectiveIntercept() bool {
@@ -39,15 +48,16 @@ func (p *Proxy) shouldIntercept(sni string) bool {
 	return p.interceptHosts.Matches(sni)
 }
 
-// serveSelectiveTLS handles one client TLS connection when interception is
-// selective: it reads the ClientHello SNI, then either terminates TLS and
-// serves the requests through handler, or tunnels the connection
+// replayConn returns conn with the already-peeked ClientHello bytes put back
+// in front, so crypto/tls can read the handshake as if nothing was consumed.
+func replayConn(conn net.Conn, peeked []byte) net.Conn {
+	return newPeekedConn(conn, bufio.NewReader(io.MultiReader(bytes.NewReader(peeked), conn)))
+}
+
+// serveSelectiveTLS handles one tunnelled (CONNECT/SOCKS5) TLS connection
+// when interception is selective: it reads the SNI, then either terminates
+// TLS and serves the requests through handler, or tunnels the connection
 // undecrypted.
-//
-// The decision is made on the SNI, never on the CONNECT target. The tunnel
-// path dials the SNI host, so deciding on the target would let a client
-// CONNECT to a tunnelled host and then send a ClientHello for an
-// intercepted one, skipping every transform that host needs.
 func (p *Proxy) serveSelectiveTLS(clientConn net.Conn, handler http.Handler) error {
 	sni, peeked, err := peekSNI(clientConn, sniPeekTimeout)
 	if err != nil {
@@ -59,45 +69,115 @@ func (p *Proxy) serveSelectiveTLS(clientConn net.Conn, handler http.Handler) err
 		return p.servePeekedSNIPassthrough(clientConn, sni, peeked)
 	}
 
-	// Replay the ClientHello bytes the peek consumed, then hand the
-	// connection to crypto/tls as if nothing had been read.
-	replay := newPeekedConn(clientConn, bufio.NewReader(io.MultiReader(bytes.NewReader(peeked), clientConn)))
-	tlsConn := tls.Server(replay, &tls.Config{
+	tlsConn := tls.Server(replayConn(clientConn, peeked), &tls.Config{
 		GetCertificate: p.getCertificate,
 		NextProtos:     []string{"h2", "http/1.1"},
 	})
 	defer func() { _ = tlsConn.Close() }()
 
-	if err := tlsConn.HandshakeContext(context.Background()); err != nil {
+	// shutdownCtx so a handshake in progress stops when the proxy shuts down.
+	if err := tlsConn.HandshakeContext(p.shutdownCtx); err != nil {
 		return fmt.Errorf("TLS handshake for %s: %w", sni, err)
 	}
 	return serveOneHTTPConn(tlsConn, handler)
 }
 
 // serveHTTPSSelective runs the HTTPS listener in mitm mode with an intercept
-// list: each connection goes through serveSelectiveTLS.
+// list. httpsServer serves the decrypted connections (so its Shutdown drains
+// them); selectiveListener routes the others to the tunnel path.
 func (p *Proxy) serveHTTPSSelective() error {
 	ln, err := net.Listen("tcp", p.httpsAddr)
 	if err != nil {
 		return fmt.Errorf("https listen: %w", err)
 	}
-	p.tlsListener = ln
+	return p.serveHTTPSSelectiveOn(ln)
+}
+
+// serveHTTPSSelectiveOn is serveHTTPSSelective on an existing listener.
+func (p *Proxy) serveHTTPSSelectiveOn(ln net.Listener) error {
+	tlsLn := tls.NewListener(p.newSelectiveListener(ln), p.httpsServer.TLSConfig)
+	p.tlsListener = tlsLn
 	p.logger.Info("https proxy starting (selective intercept)", slog.String("addr", ln.Addr().String()))
-	handler := http.HandlerFunc(p.handleDirectHTTP)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if p.shutdownCtx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-			p.logger.Warn("https accept error", slog.String("error", err.Error()))
-			continue
-		}
-		go func() {
-			defer func() { _ = conn.Close() }()
-			if err := p.serveSelectiveTLS(conn, handler); err != nil {
-				p.logger.Debug("https selective intercept error", slog.String("error", err.Error()))
-			}
-		}()
+	return fmt.Errorf("https: %w", p.httpsServer.Serve(tlsLn))
+}
+
+// selectiveListener wraps the raw HTTPS listener. Each accepted connection
+// has its SNI peeked in its own goroutine (so a slow client cannot stall
+// Accept): intercepted connections are handed to Accept's caller with the
+// peeked bytes replayed; the rest are tunnelled undecrypted right there.
+//
+// Goroutine lifecycles: the accept loop ends when the raw listener closes
+// (Close, or httpsServer.Shutdown closing it). A routing goroutine ends
+// after the peek (bounded by sniPeekTimeout) once its connection is handed
+// over, dropped because the listener closed, or tunnelled; a tunnel ends
+// when either side closes or shutdownCtx is cancelled.
+type selectiveListener struct {
+	net.Listener
+	p *Proxy
+
+	conns     chan net.Conn
+	acceptErr chan error
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (p *Proxy) newSelectiveListener(ln net.Listener) *selectiveListener {
+	l := &selectiveListener{
+		Listener:  ln,
+		p:         p,
+		conns:     make(chan net.Conn),
+		acceptErr: make(chan error, 1),
+		done:      make(chan struct{}),
 	}
+	go l.acceptLoop()
+	return l
+}
+
+func (l *selectiveListener) acceptLoop() {
+	for {
+		conn, err := l.Listener.Accept()
+		if err != nil {
+			l.acceptErr <- err // buffered: the loop ends here, so at most one send
+			return
+		}
+		go l.route(conn)
+	}
+}
+
+func (l *selectiveListener) route(conn net.Conn) {
+	sni, peeked, err := peekSNI(conn, sniPeekTimeout)
+	if err != nil {
+		_ = conn.Close()
+		l.p.logger.Debug("https selective intercept: peek sni", slog.String("error", err.Error()))
+		return
+	}
+	if !l.p.shouldIntercept(sni) {
+		if err := l.p.servePeekedSNIPassthrough(conn, sni, peeked); err != nil {
+			l.p.logger.Debug("https selective intercept: passthrough", slog.String("error", err.Error()))
+		}
+		return
+	}
+	select {
+	case l.conns <- replayConn(conn, peeked):
+	case <-l.done:
+		_ = conn.Close()
+	}
+}
+
+// Accept returns the next connection to decrypt.
+func (l *selectiveListener) Accept() (net.Conn, error) {
+	select {
+	case conn := <-l.conns:
+		return conn, nil
+	case err := <-l.acceptErr:
+		return nil, err
+	case <-l.done:
+		return nil, net.ErrClosed
+	}
+}
+
+// Close stops Accept and closes the raw listener, which ends the accept loop.
+func (l *selectiveListener) Close() error {
+	l.closeOnce.Do(func() { close(l.done) })
+	return l.Listener.Close()
 }
