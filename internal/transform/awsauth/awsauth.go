@@ -22,6 +22,12 @@
 // default; set allow_chunked_body: true to opt out of the chunked check, or
 // unsigned_payload: true to sign without buffering the body at all (S3
 // streaming uploads, etc.).
+//
+// Setting placeholder_access_key_id (Cryptex addition) replaces "re-sign
+// every SigV4 request, reject everything else" with a write policy: only
+// requests signed with that placeholder key are re-signed, reads pass
+// untouched, and a write passes only if it carries a credential the proxy
+// put there. See writePolicy.
 package awsauth
 
 import (
@@ -72,6 +78,12 @@ type config struct {
 	UnsignedPayload     bool                   `yaml:"unsigned_payload,omitempty"`
 	AllowChunkedBody    bool                   `yaml:"allow_chunked_body,omitempty"`
 	Rules               []hostmatch.RuleConfig `yaml:"rules"`
+
+	// PlaceholderAccessKeyID turns on the write policy (see writePolicy).
+	// It is the access key ID the client's placeholder credentials use: a
+	// public value, not a secret. Empty keeps the upstream behaviour: every
+	// SigV4 request is re-signed and anything unsigned is rejected.
+	PlaceholderAccessKeyID string `yaml:"placeholder_access_key_id,omitempty"`
 }
 
 // sourceBuilder is the signature of secrets.BuildSource, factored out so tests
@@ -98,6 +110,9 @@ type AWSAuth struct {
 	creds            aws.CredentialsProvider
 	unsignedPayload  bool
 	allowChunkedBody bool
+
+	// placeholderAccessKeyID, when set, turns on the write policy.
+	placeholderAccessKeyID string
 
 	now  func() time.Time
 	sign signFunc
@@ -171,7 +186,10 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder, buildCred
 		creds:            creds,
 		unsignedPayload:  c.UnsignedPayload,
 		allowChunkedBody: c.AllowChunkedBody,
-		now:              time.Now,
+
+		placeholderAccessKeyID: c.PlaceholderAccessKeyID,
+
+		now: time.Now,
 		sign: func(ctx context.Context, creds aws.Credentials, req *http.Request, payloadHash, service, region string, signingTime time.Time) error {
 			return signer.SignHTTP(ctx, creds, req, payloadHash, service, region, signingTime)
 		},
@@ -233,6 +251,13 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 
 	if !hostmatch.MatchAnyRule(a.rules, req) {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
+
+	if a.placeholderAccessKeyID != "" {
+		resign, result := a.writePolicy(tctx, req)
+		if !resign {
+			return result, nil
+		}
 	}
 
 	scope, err := parseInboundScope(req)
@@ -300,18 +325,83 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	tctx.Annotate("injected", injected)
 	tctx.Annotate("service", scope.service)
 	tctx.Annotate("region", scope.region)
+	tctx.MarkCredentialInjected("aws_auth")
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
+}
+
+// writePolicy decides, when placeholder_access_key_id is set, what happens
+// to a request on a matched AWS host. The rule is: anything that writes to
+// AWS must carry a credential the proxy holds; reads may carry anything.
+//
+//	signed with the placeholder key (Authorization header)  -> re-sign it
+//	presigned with the placeholder key (query string)        -> reject: not supported yet
+//	anything else (unsigned, Basic auth, another key):
+//	  GET / HEAD / OPTIONS                                   -> pass untouched
+//	  write, and an earlier transform injected a credential  -> pass untouched
+//	  write, nothing injected                                -> reject
+//
+// "Anything else" covers, for example, the ECR registry's Basic auth (its
+// token is swapped in by credential_mask, which marks the request) and the
+// layer downloads ECR redirects to, presigned by AWS itself. A write the
+// proxy did not authorize is the exfiltration case: the client's own AWS
+// keys or presigned URL, or an unsigned POST to an API Gateway or load
+// balancer someone else runs on amazonaws.com.
+//
+// The injected-credential check depends on pipeline order: transforms that
+// swap credentials (credential_mask) must run before aws_auth. In the wrong
+// order the write is rejected, which is the safe direction.
+//
+// resign=true means continue to the normal re-sign path. Otherwise result
+// is what the transform returns.
+func (a *AWSAuth) writePolicy(tctx *transform.TransformContext, req *http.Request) (bool, *transform.TransformResult) {
+	if auth := req.Header.Get("Authorization"); strings.HasPrefix(auth, sigV4Algorithm+" ") {
+		if scope, err := parseAuthHeaderScope(auth); err == nil && scope.accessKeyID == a.placeholderAccessKeyID {
+			return true, nil
+		}
+	}
+	if cred := req.URL.Query().Get("X-Amz-Credential"); cred != "" {
+		if scope, err := parseCredentialPath(cred); err == nil && scope.accessKeyID == a.placeholderAccessKeyID {
+			// Re-signing a presigned URL means signing again in the query
+			// string, which this transform does not do. Fail loudly rather
+			// than send a URL that cannot work.
+			tctx.Annotate("rejected", "presigned_placeholder_not_supported")
+			return false, &transform.TransformResult{
+				Action:   transform.ActionReject,
+				Response: errorResponse(req, http.StatusBadRequest, "presigned_placeholder_not_supported"),
+			}
+		}
+	}
+
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		tctx.Annotate("passthrough", "read_not_signed_by_proxy")
+		return false, &transform.TransformResult{Action: transform.ActionContinue}
+	}
+
+	if injectedBy := tctx.CredentialsInjectedBy(); len(injectedBy) > 0 {
+		tctx.Annotate("passthrough", "write_with_proxy_credential")
+		tctx.Annotate("credential_injected_by", injectedBy)
+		return false, &transform.TransformResult{Action: transform.ActionContinue}
+	}
+
+	tctx.Annotate("rejected", "write_not_signed_by_proxy")
+	return false, &transform.TransformResult{
+		Action:   transform.ActionReject,
+		Response: errorResponse(req, http.StatusForbidden, "write_not_signed_by_proxy"),
+	}
 }
 
 func (a *AWSAuth) TransformResponse(context.Context, *transform.TransformContext, *http.Request, *http.Response) (*transform.TransformResult, error) {
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
-// credentialScope is the (region, service) pair extracted from an inbound
-// SigV4 signature.
+// credentialScope is the access key ID and (region, service) pair extracted
+// from an inbound SigV4 signature. The access key ID is the public half of
+// the signing key: it says who signed, without revealing the secret.
 type credentialScope struct {
-	region  string
-	service string
+	accessKeyID string
+	region      string
+	service     string
 }
 
 var errNoSigV4 = errors.New("request has no SigV4 signature (no Authorization header or X-Amz-Credential query param)")
@@ -357,7 +447,7 @@ func parseCredentialPath(cred string) (credentialScope, error) {
 	if parts[2] == "" || parts[3] == "" {
 		return credentialScope{}, fmt.Errorf("malformed credential scope %q: empty region or service", cred)
 	}
-	return credentialScope{region: parts[2], service: parts[3]}, nil
+	return credentialScope{accessKeyID: parts[0], region: parts[2], service: parts[3]}, nil
 }
 
 // stripInboundSignatureHeaders removes every header SignHTTP is going to
