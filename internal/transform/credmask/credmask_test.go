@@ -548,6 +548,51 @@ func TestOAuthNonJSONResponsePassesThrough(t *testing.T) {
 	require.Equal(t, upstream, readAll(t, resp.Body))
 }
 
+// proxy.max_response_body_bytes truncates silently, so a token response can
+// arrive cut off after the real refresh token. A JSON body that does not
+// parse must fail closed; a body that is not JSON at all still passes.
+func TestOAuthUnparsableJSONFailsClosed(t *testing.T) {
+	full := `{"access_token":"sk-ant-oat01-short","refresh_token":"` + realClaude + `","expires_in":28800}`
+	truncated := full[:strings.Index(full, realClaude)+len(realClaude)]
+
+	tests := []struct {
+		name       string
+		ctype      string
+		body       string
+		wantReject bool
+	}{
+		{name: "truncated with json content type", ctype: "application/json", body: truncated, wantReject: true},
+		{name: "truncated with no content type", ctype: "", body: truncated, wantReject: true},
+		{name: "truncated before the token", ctype: "application/json", body: `{"access_tok`, wantReject: true},
+		{name: "empty json body", ctype: "application/json", body: "", wantReject: false},
+		{name: "html error page", ctype: "text/html", body: "<html>bad gateway</html>", wantReject: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _ := newTestTransform(t)
+			req := newReq("POST", claudeToken, nil)
+			header := http.Header{}
+			if tc.ctype != "" {
+				header.Set("Content-Type", tc.ctype)
+			}
+			resp := newResp(req, 200, header, []byte(tc.body))
+
+			res, err := m.TransformResponse(context.Background(), tctx(), req, resp)
+			require.NoError(t, err)
+
+			if tc.wantReject {
+				require.Equal(t, transform.ActionReject, res.Action)
+				require.Equal(t, http.StatusInternalServerError, res.Response.StatusCode)
+				require.NotContains(t, string(readAll(t, res.Response.Body)), realClaude)
+				return
+			}
+			require.Equal(t, transform.ActionContinue, res.Action)
+			require.Equal(t, tc.body, string(readAll(t, resp.Body)))
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------

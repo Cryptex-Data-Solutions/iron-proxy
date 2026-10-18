@@ -40,7 +40,9 @@
 //
 //   - Masking (responses): if a real credential cannot be masked, the
 //     response is REPLACED with a 500 so the login/refresh fails loudly. A
-//     real credential never reaches the client.
+//     real credential never reaches the client. That includes a JSON token
+//     response that does not parse: it may have been cut short by
+//     proxy.max_response_body_bytes with the real token still in it.
 //   - Swapping (requests): if the store errors, the mask is left in place.
 //     It goes upstream, earns a clean 401, and nothing leaks.
 //   - Swapping happens only inside TLS. Every rule that swaps a real
@@ -685,8 +687,20 @@ func (m *CredMask) maskOAuthRefresh(tctx *transform.TransformContext, req *http.
 	if err != nil {
 		return m.abort(tctx, req, p.kind, fmt.Sprintf("cannot read token response: %v", err))
 	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		return cont
+	}
+	ctype := resp.Header.Get("Content-Type")
+	looksLikeJSON := strings.Contains(ctype, "application/json") || bytes.HasPrefix(bytes.TrimSpace(body), []byte("{"))
 	obj, ok := parseJSONObject(body)
 	if !ok {
+		if looksLikeJSON {
+			// A JSON body that does not parse may be a token response cut
+			// short by proxy.max_response_body_bytes, with the real refresh
+			// token still in the part that arrived. Passing it through would
+			// leak it, so abort instead.
+			return m.abort(tctx, req, p.kind, "token response is JSON but does not parse (truncated?)")
+		}
 		return cont // not a JSON token response (error page, other endpoint)
 	}
 	val, ok := obj[p.field].(string)
