@@ -458,14 +458,19 @@ func TestDecodedSizeLimits(t *testing.T) {
 	issuanceOverLimit := append(bytes.Repeat([]byte(" "), tokenMaxDecodedBytes), []byte(`{"access_token":"`+realGitHub+`"}`)...)
 	oauthOverLimit := append(bytes.Repeat([]byte(" "), tokenMaxDecodedBytes), []byte(`{"refresh_token":"`+realClaude+`"}`)...)
 
+	smallOAuth := []byte(`{"refresh_token":"` + realClaude + `"}`)
+
 	tests := []struct {
-		name       string
-		kind       string // "echo", "issuance" or "oauth"
-		decoded    []byte
-		gzip       bool
-		wantReject bool // login/refresh: aborted with a 500
-		wantMasked bool // echo: real token re-masked
+		name           string
+		kind           string // "echo", "issuance" or "oauth"
+		decoded        []byte
+		gzip           bool
+		declaredLength int64 // 0 = the real length; else overrides Content-Length
+		wantReject     bool  // login/refresh: aborted with a 500
+		wantUnread     bool  // login/refresh: body never read (rejected on headers alone)
+		wantMasked     bool  // echo: real token re-masked
 	}{
+		{name: "oauth declared length past the limit is not read", kind: "oauth", decoded: smallOAuth, declaredLength: tokenMaxDecodedBytes + 1, wantReject: true, wantUnread: true},
 		{name: "echo gzip decodes to exactly the limit", kind: "echo", decoded: echoAtLimit, gzip: true, wantMasked: true},
 		{name: "echo gzip decodes past the limit", kind: "echo", decoded: echoOverLimit, gzip: true, wantMasked: false},
 		{name: "issuance gzip decodes past the limit", kind: "issuance", decoded: issuanceOverLimit, gzip: true, wantReject: true},
@@ -496,6 +501,9 @@ func TestDecodedSizeLimits(t *testing.T) {
 				require.LessOrEqual(t, len(upstream), echoMaxBytes, "compressed body must pass the compressed-size check")
 			}
 			resp := newResp(req, 200, header, upstream)
+			if tc.declaredLength != 0 {
+				resp.ContentLength = tc.declaredLength
+			}
 
 			res, err := m.TransformResponse(context.Background(), tctx(), req, resp)
 			require.NoError(t, err)
@@ -504,6 +512,9 @@ func TestDecodedSizeLimits(t *testing.T) {
 				if tc.wantReject {
 					require.Equal(t, transform.ActionReject, res.Action)
 					require.Equal(t, http.StatusInternalServerError, res.Response.StatusCode)
+				}
+				if tc.wantUnread {
+					require.Equal(t, -1, transform.RequireBufferedBody(resp.Body).Len(), "body must not be read")
 				}
 				return
 			}

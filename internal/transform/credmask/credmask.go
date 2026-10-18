@@ -136,8 +136,8 @@ const echoMaxBytes = 256 * 1024
 // than being decompressed into memory.
 const tokenMaxDecodedBytes = 1024 * 1024
 
-// errDecodedTooLarge is returned by readDecodedBody when the decoded body is
-// over its limit.
+// errDecodedTooLarge is returned by readDecodedBody when the decoded body, or
+// the declared Content-Length, is over its limit.
 var errDecodedTooLarge = errors.New("decoded body is over the size limit")
 
 var echoTextContentTypes = []string{"application/json", "text/", "application/x-www-form-urlencoded"}
@@ -783,9 +783,20 @@ func (m *CredMask) abort(tctx *transform.TransformContext, req *http.Request, ki
 // limit is applied while decompressing, so a small body that expands to a
 // huge one (a decompression bomb) stops at limit+1 bytes instead of filling
 // memory.
+//
+// A body whose Content-Length is already over limit also returns
+// errDecodedTooLarge, before any of it is read. The headers arrive first, so
+// this costs nothing. A body of unknown length (chunked, HTTP/2 without
+// Content-Length) is still read in full before the limit applies: the
+// pipeline's BufferedBody reads the whole body on the first Read. On the
+// login/refresh paths that body comes from the provider over TLS;
+// proxy.max_response_body_bytes caps it if needed.
 func readDecodedBody(resp *http.Response, limit int64) ([]byte, error) {
 	if resp.Body == nil {
 		return nil, nil
+	}
+	if resp.ContentLength > limit {
+		return nil, errDecodedTooLarge
 	}
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
