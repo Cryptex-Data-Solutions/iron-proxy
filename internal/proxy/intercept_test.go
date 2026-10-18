@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -326,4 +327,69 @@ func TestSelectiveIntercept_ShutdownDrainsInFlightRequest(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Shutdown did not return after the request finished")
 	}
+}
+
+// temporaryErr is an accept error marked temporary, like EMFILE.
+type temporaryErr struct{}
+
+func (temporaryErr) Error() string   { return "too many open files" }
+func (temporaryErr) Timeout() bool   { return false }
+func (temporaryErr) Temporary() bool { return true }
+
+// flakyListener fails its first Accept with a temporary error, then
+// behaves like the real listener it wraps.
+type flakyListener struct {
+	net.Listener
+	failed atomic.Bool
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	if !l.failed.Swap(true) {
+		return nil, temporaryErr{}
+	}
+	return l.Listener.Accept()
+}
+
+// A temporary accept error must not stop the listener: the next connection
+// is still routed.
+func TestSelectiveListener_RetriesTemporaryAcceptErrors(t *testing.T) {
+	p := New(Options{Logger: testLogger(), InterceptHosts: []string{"localhost"}})
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	l := p.newSelectiveListener(&flakyListener{Listener: raw})
+	t.Cleanup(func() { _ = l.Close() })
+
+	// The handshake never completes (nobody answers), so the client goroutine
+	// just ends when the test closes the connection; its error is irrelevant.
+	go func() {
+		conn, err := tls.Dial("tcp", raw.Addr().String(), &tls.Config{ServerName: "localhost", InsecureSkipVerify: true})
+		if err == nil {
+			_ = conn.Close()
+		}
+	}()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := l.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+	select {
+	case conn := <-accepted:
+		_ = conn.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("no connection accepted after a temporary accept error")
+	}
+}
+
+func TestSelectiveListener_PermanentErrorEndsAccept(t *testing.T) {
+	p := New(Options{Logger: testLogger(), InterceptHosts: []string{"localhost"}})
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	l := p.newSelectiveListener(raw)
+	require.NoError(t, raw.Close()) // the raw listener fails for good
+
+	_, err = l.Accept()
+	require.Error(t, err)
 }

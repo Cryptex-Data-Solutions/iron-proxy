@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"sync"
+	"time"
 )
 
 // Selective interception (tls.intercept / tls.intercept_exclude).
@@ -133,15 +135,49 @@ func (p *Proxy) newSelectiveListener(ln net.Listener) *selectiveListener {
 	return l
 }
 
+// acceptLoop mirrors http.Server's accept loop: a temporary error (for
+// example EMFILE, out of file descriptors) is retried with a growing delay
+// instead of ending the loop, because http.Server would keep calling
+// Accept and nothing would ever arrive. A closed listener or a permanent
+// error is passed to Accept's caller once, and the loop ends.
 func (l *selectiveListener) acceptLoop() {
+	var delay time.Duration
 	for {
 		conn, err := l.Listener.Accept()
 		if err != nil {
+			if isTemporaryAcceptError(err) {
+				select {
+				case <-l.done:
+					l.acceptErr <- net.ErrClosed // buffered: the loop ends here, so at most one send
+					return
+				default:
+				}
+				if delay == 0 {
+					delay = 5 * time.Millisecond
+				} else {
+					delay *= 2
+				}
+				if delay > time.Second {
+					delay = time.Second
+				}
+				l.p.logger.Warn("https accept error; retrying", slog.String("error", err.Error()), slog.Duration("delay", delay))
+				time.Sleep(delay)
+				continue
+			}
 			l.acceptErr <- err // buffered: the loop ends here, so at most one send
 			return
 		}
+		delay = 0
 		go l.route(conn)
 	}
+}
+
+// isTemporaryAcceptError reports whether an Accept error is worth retrying,
+// by the same test http.Server uses. Temporary() is deprecated on net.Error
+// in general but is still how accept errors like EMFILE are marked.
+func isTemporaryAcceptError(err error) bool {
+	var t interface{ Temporary() bool }
+	return !errors.Is(err, net.ErrClosed) && errors.As(err, &t) && t.Temporary()
 }
 
 func (l *selectiveListener) route(conn net.Conn) {
