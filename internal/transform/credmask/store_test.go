@@ -163,10 +163,6 @@ func TestMaskPrefixKept(t *testing.T) {
 	require.Len(t, mask, len(real))
 	require.True(t, s.IsMask(mask))
 	require.False(t, s.IsMask(real))
-
-	got, ok := s.MaskFor(real, "10.0.0.5")
-	require.True(t, ok)
-	require.Equal(t, mask, got)
 }
 
 func TestOpenSharedReturnsSameStore(t *testing.T) {

@@ -35,9 +35,9 @@ import (
 // another mask's record. A stolen vault.json alone does not give up the
 // secrets.
 //
-// Lookups by secret (to keep issuance idempotent and to find the mask
-// for an echoed token) use an HMAC keyed from the master key, so the
-// file never holds a bare hash someone could grind against a guess.
+// Lookups by secret (to keep issuance idempotent) use an HMAC keyed from
+// the master key, so the file never holds a bare hash someone could grind
+// against a guess.
 type Store struct {
 	mu sync.Mutex
 
@@ -260,16 +260,6 @@ func (s *Store) IsMask(value string) bool {
 	defer s.mu.Unlock()
 	_, ok := s.byMask[value]
 	return ok
-}
-
-// MaskFor returns the existing mask for (secret, source), without minting.
-// Used to re-mask a real token echoed back in a response.
-func (s *Store) MaskFor(secret, source string) (string, bool) {
-	lookup := s.lookupHMAC(secret, source)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	mask, ok := s.byLookup[lookup]
-	return mask, ok
 }
 
 // saveLocked writes every record to vault.json via a temp file and rename,

@@ -15,17 +15,11 @@
 //     Authorization (`token <mask>`, `Bearer <mask>`, or Basic auth with the
 //     mask as the password, as git-over-HTTPS does). The mask is swapped for
 //     the real token before the request goes upstream. Only headers are
-//     touched, so large request bodies (a big `git push`) still stream.
-//  3. Echo re-masking (response). If a response body echoes the real token
-//     we swapped in, it is re-masked before it reaches the client. This is
-//     best effort, a backstop rather than a guarantee: only text-like
-//     bodies known to be at most echoMaxBytes, both as sent and once gzip
-//     is decoded, are scanned. Larger bodies,
-//     bodies of unknown length (chunked, HTTP/2 without Content-Length),
-//     SSE streams and binary types (git packfiles) pass through unscanned. Failing closed
-//     on those would block every git fetch and clone, and GitHub does not
-//     echo OAuth tokens back in responses.
-//  4. Refresh (request). GitHub App user tokens expire and are refreshed
+//     touched, so large request bodies (a big `git push`) still stream, and
+//     responses are not read: the real token exists only in this store and
+//     at GitHub, so nothing the client could have written can contain it,
+//     and GitHub does not reflect the Authorization header back.
+//  3. Refresh (request). GitHub App user tokens expire and are refreshed
 //     by POSTing the refresh_token (masked at issuance, step 1) back to the
 //     issuance endpoint. The mask is swapped for the real refresh token in
 //     the query string or a form/JSON body, inside TLS only.
@@ -52,10 +46,10 @@
 //     sent in clear text. Masking (responses) still runs on plain HTTP: it is
 //     the safe direction.
 //
-// iron-proxy never decompresses bodies, so this transform narrows
-// Accept-Encoding on the requests whose responses it must read, and decodes
-// gzip itself. A body in any other encoding on an issuance/refresh endpoint
-// fails closed.
+// iron-proxy never decompresses bodies, so this transform asks for
+// Accept-Encoding: identity on the issuance/refresh requests whose responses
+// it must read, and decodes gzip itself if upstream sends it anyway. A body
+// in any other encoding on an issuance/refresh endpoint fails closed.
 //
 // Example config:
 //
@@ -125,12 +119,6 @@ var githubTokenFields = []string{"access_token", "refresh_token"}
 // credential, is never sent there.
 const githubAuthKind = "github:access_token"
 
-// Echo re-masking only scans small, text-like responses. Packfiles and other
-// large/binary bodies won't echo a token, and reading them would buffer them
-// in memory. text/event-stream is excluded so streams are never buffered.
-// Anything skipped is forwarded unscanned, not rejected: see the package doc.
-const echoMaxBytes = 256 * 1024
-
 // tokenMaxDecodedBytes bounds a decoded login/refresh response. Real token
 // responses are well under 1 KiB; anything larger than this aborts rather
 // than being decompressed into memory.
@@ -139,8 +127,6 @@ const tokenMaxDecodedBytes = 1024 * 1024
 // errDecodedTooLarge is returned by readDecodedBody when the decoded body, or
 // the declared Content-Length, is over its limit.
 var errDecodedTooLarge = errors.New("decoded body is over the size limit")
-
-var echoTextContentTypes = []string{"application/json", "text/", "application/x-www-form-urlencoded"}
 
 type config struct {
 	StoreDir      string               `yaml:"store_dir"`
@@ -374,9 +360,6 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 	}
 
 	req.Header.Set("Authorization", newAuth)
-	// The response may echo the real token and we will need to read it.
-	// Keep compression only if it is gzip, which we can decode.
-	narrowAcceptEncodingToGzip(req)
 	tctx.Annotate("swapped", "github:authorization")
 }
 
@@ -516,20 +499,6 @@ func (m *CredMask) swapGitHubRefreshInBody(contentType string, data []byte, sour
 	return []byte(form.Encode()), true, nil
 }
 
-// narrowAcceptEncodingToGzip keeps gzip if the client offered it, otherwise
-// asks for identity. Leaves a request with no Accept-Encoding alone.
-func narrowAcceptEncodingToGzip(req *http.Request) {
-	ae := req.Header.Get("Accept-Encoding")
-	if ae == "" {
-		return
-	}
-	if strings.Contains(strings.ToLower(ae), "gzip") {
-		req.Header.Set("Accept-Encoding", "gzip")
-		return
-	}
-	req.Header.Set("Accept-Encoding", "identity")
-}
-
 // ---------------------------------------------------------------------------
 // Response side
 // ---------------------------------------------------------------------------
@@ -539,11 +508,6 @@ func (m *CredMask) TransformResponse(_ context.Context, tctx *transform.Transfor
 
 	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubIssue, req) {
 		return m.maskGitHubIssuance(tctx, req, resp), nil
-	}
-
-	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubConsume, req) {
-		m.remaskGitHubEcho(tctx, req, resp)
-		return cont, nil
 	}
 
 	if p := m.matchingOAuth(req); p != nil {
@@ -633,67 +597,6 @@ func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *htt
 		tctx.Annotate("masked", "github:issue")
 	}
 	return cont
-}
-
-// remaskGitHubEcho re-masks a real token echoed back in a response to a
-// request we swapped. Which real token we swapped is re-derived from the
-// request's (now real) Authorization header and confirmed against the store.
-func (m *CredMask) remaskGitHubEcho(tctx *transform.TransformContext, req *http.Request, resp *http.Response) {
-	real := realTokenFromAuth(req.Header.Get("Authorization"))
-	if real == "" {
-		return
-	}
-	mask, ok := m.store.MaskFor(real, sourceOf(req))
-	if !ok {
-		return // not a token we swapped in
-	}
-
-	ctype := resp.Header.Get("Content-Type")
-	if strings.HasPrefix(ctype, "text/event-stream") || !containsAny(ctype, echoTextContentTypes) {
-		return
-	}
-	// The body must be known to be small BEFORE it is read: the pipeline's
-	// BufferedBody reads the whole body into memory on the first Read, so a
-	// limited read would not bound memory. The size is known from
-	// Content-Length, or from Len() if an earlier transform already read it.
-	// Chunked and HTTP/2 responses without Content-Length are skipped.
-	size := resp.ContentLength
-	if size < 0 && resp.Body != nil {
-		size = int64(transform.RequireBufferedBody(resp.Body).Len())
-	}
-	if size < 0 {
-		tctx.Annotate("echo_skipped", "unknown-length")
-		return
-	}
-	if size > echoMaxBytes {
-		tctx.Annotate("echo_skipped", "too-large")
-		return
-	}
-	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
-	if enc != "" && enc != "identity" && enc != "gzip" {
-		// We narrowed Accept-Encoding to gzip, so this should not happen.
-		// Record it rather than guess at the encoding.
-		tctx.Annotate("echo_skipped", "content-encoding:"+enc)
-		return
-	}
-
-	// The check above bounds the compressed size; this bounds the decoded
-	// size, so a small gzip body cannot expand into a huge one in memory.
-	body, err := readDecodedBody(resp, echoMaxBytes)
-	if errors.Is(err, errDecodedTooLarge) {
-		tctx.Annotate("echo_skipped", "too-large-decoded")
-		return
-	}
-	if err != nil {
-		m.logger.Error("credential_mask: echo re-mask read failed", slog.String("error", err.Error()))
-		return
-	}
-	if !bytes.Contains(body, []byte(real)) {
-		return
-	}
-	setResponseBody(resp, bytes.ReplaceAll(body, []byte(real), []byte(mask)))
-	m.logger.Info("credential_mask: re-masked echoed github token in response")
-	tctx.Annotate("remasked", "github:echo")
 }
 
 func (m *CredMask) maskOAuthRefresh(tctx *transform.TransformContext, req *http.Request, resp *http.Response, p *oauthProvider) *transform.TransformResult {
@@ -844,30 +747,6 @@ func setResponseBody(resp *http.Response, data []byte) {
 	resp.Uncompressed = false
 }
 
-// realTokenFromAuth pulls the credential out of a token/Bearer/Basic header.
-func realTokenFromAuth(auth string) string {
-	scheme, value, ok := strings.Cut(auth, " ")
-	if !ok {
-		return ""
-	}
-	value = strings.TrimSpace(value)
-	switch strings.ToLower(scheme) {
-	case "token", "bearer":
-		return value
-	case "basic":
-		decoded, err := base64.StdEncoding.DecodeString(value)
-		if err != nil {
-			return ""
-		}
-		_, pw, ok := strings.Cut(string(decoded), ":")
-		if !ok {
-			return ""
-		}
-		return pw
-	}
-	return ""
-}
-
 // parseJSONObject decodes a JSON object, keeping numbers exact.
 func parseJSONObject(data []byte) (map[string]any, bool) {
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -893,15 +772,6 @@ func encodeJSON(obj map[string]any) ([]byte, error) {
 func hasAnyPrefix(s string, prefixes []string) bool {
 	for _, p := range prefixes {
 		if strings.HasPrefix(s, p) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsAny(s string, subs []string) bool {
-	for _, sub := range subs {
-		if strings.Contains(s, sub) {
 			return true
 		}
 	}
