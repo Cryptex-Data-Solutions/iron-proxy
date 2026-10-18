@@ -432,6 +432,7 @@ func (o *OAuth) TransformRequest(ctx context.Context, tctx *transform.TransformC
 	req.Header.Set(entry.header, entry.valuePrefix+tok)
 	tctx.Annotate("grant", entry.grant)
 	tctx.Annotate("injected", []string{"header:" + http.CanonicalHeaderKey(entry.header)})
+	tctx.MarkCredentialInjected(o.Name())
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 
