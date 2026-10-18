@@ -137,6 +137,41 @@ log:
 			wantErr: "unknown log level",
 		},
 		{
+			name: "intercept list in sni-only mode",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  mode: sni-only
+  intercept: ["github.com"]
+`,
+			wantErr: "only apply in \"mitm\" mode",
+		},
+		{
+			name: "intercept entry is a URL, not a host",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  intercept: ["https://github.com"]
+`,
+			wantErr: "tls.intercept[0]",
+		},
+		{
+			name: "intercept_exclude entry has a port",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  intercept_exclude: ["ssm.af-south-1.amazonaws.com:443"]
+`,
+			wantErr: "tls.intercept_exclude[0]",
+		},
+		{
 			name: "dns record missing name",
 			yaml: `
 dns:

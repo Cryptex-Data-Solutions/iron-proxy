@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -139,7 +140,18 @@ type TLS struct {
 	// CA, and run the full request/response pipeline.
 	// "sni-only": peek the ClientHello SNI, run the pipeline with a host-only
 	// synthetic request, and TCP-passthrough to the upstream. No CA required.
-	Mode                string `yaml:"mode"`
+	Mode string `yaml:"mode"`
+
+	// Intercept, in mitm mode, limits TLS interception to these hosts
+	// (exact names or "*.example.com" globs, matched against the ClientHello
+	// SNI). Every other host is tunnelled like sni-only mode: the pipeline
+	// runs on the SNI alone and the bytes are passed through undecrypted.
+	// Empty means intercept every host (the default).
+	Intercept []string `yaml:"intercept,omitempty"`
+	// InterceptExclude, in mitm mode, names hosts that are never
+	// intercepted, even when Intercept (or the empty default) covers them.
+	InterceptExclude []string `yaml:"intercept_exclude,omitempty"`
+
 	CACert              string `yaml:"ca_cert"`
 	CAKey               string `yaml:"ca_key"`
 	CertCacheSize       int    `yaml:"cert_cache_size"`
@@ -297,8 +309,21 @@ func Validate(cfg *Config) error {
 		}
 	case TLSModeSNIOnly:
 		// CA cert/key are ignored in sni-only mode; no requirement.
+		if len(cfg.TLS.Intercept) > 0 || len(cfg.TLS.InterceptExclude) > 0 {
+			return fmt.Errorf("tls.intercept and tls.intercept_exclude only apply in %q mode; sni-only never intercepts", TLSModeMITM)
+		}
 	default:
 		return fmt.Errorf("tls.mode must be %q or %q; got %q", TLSModeMITM, TLSModeSNIOnly, cfg.TLS.Mode)
+	}
+	for _, list := range []struct {
+		name  string
+		hosts []string
+	}{{"tls.intercept", cfg.TLS.Intercept}, {"tls.intercept_exclude", cfg.TLS.InterceptExclude}} {
+		for i, h := range list.hosts {
+			if strings.TrimSpace(h) == "" || strings.ContainsAny(h, "/: ") {
+				return fmt.Errorf("%s[%d]: %q is not a host name or *.domain glob", list.name, i, h)
+			}
+		}
 	}
 
 	if _, err := parseLogLevel(cfg.Log.Level); err != nil {

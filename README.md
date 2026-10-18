@@ -803,6 +803,22 @@ iron-proxy generates leaf certificates on the fly, signed by the CA you provide.
 The client container must trust this CA (add it to the system trust store or pass
 it via `--cacert`). Certs are cached in an LRU cache keyed by SNI hostname.
 
+By default every TLS connection is decrypted. To decrypt only the hosts your
+transforms need, set `tls.intercept` (and optionally `tls.intercept_exclude`)
+to exact host names or `*.domain` globs:
+
+```yaml
+tls:
+  intercept: ["github.com", "*.amazonaws.com"]
+  intercept_exclude: ["ssm.us-east-1.amazonaws.com"]
+```
+
+A connection whose ClientHello SNI is not intercepted is tunnelled the way
+`sni-only` mode does it: the pipeline runs on the SNI alone, so the allowlist
+still applies, and the bytes pass through undecrypted. The decision follows
+the SNI, not the CONNECT target, so a client cannot CONNECT to a tunnelled
+host and then talk to an intercepted one undecrypted.
+
 ## Routing traffic to the proxy
 
 There are three approaches, with increasing enforcement.

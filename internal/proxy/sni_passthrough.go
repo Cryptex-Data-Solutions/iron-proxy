@@ -42,6 +42,15 @@ func (p *Proxy) serveSNIPassthrough(clientConn net.Conn) error {
 	if err != nil {
 		return fmt.Errorf("peek sni: %w", err)
 	}
+	return p.servePeekedSNIPassthrough(clientConn, sni, peeked)
+}
+
+// servePeekedSNIPassthrough is serveSNIPassthrough after the ClientHello has
+// been peeked: sni is its server name and peeked the bytes read, which are
+// replayed to the upstream. Also used for hosts a selective intercept list
+// leaves undecrypted.
+func (p *Proxy) servePeekedSNIPassthrough(clientConn net.Conn, sni string, peeked []byte) error {
+	defer clientConn.Close()
 
 	// Set up audit first so even empty-SNI rejections get logged.
 	result := &transform.PipelineResult{
