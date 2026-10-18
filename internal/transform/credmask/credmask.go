@@ -3,7 +3,8 @@
 //
 // It is the native Go port of the Cryptex mitmproxy addons
 // (github_tokenize.py, oauth_refresh_tokenize.py, vault.py in
-// cryptex-dev-sandbox). Two credential families are handled:
+// cryptex-dev-sandbox), plus the Amazon ECR registry token. Three credential
+// families are handled:
 //
 // GitHub OAuth tokens (gho_/ghu_/ghs_/ghr_/ghp_):
 //
@@ -30,6 +31,19 @@
 //     issuance and every rotated token on refresh.
 //   - Request: a masked refresh_token in the JSON body is swapped back for
 //     the real value before the refresh goes upstream.
+//
+// Amazon ECR registry token:
+//
+//   - Response: GetAuthorizationToken (`aws ecr get-login-password`, the
+//     docker credential helper) returns base64("AWS:<token>"). The token is
+//     masked and the pair re-encoded.
+//   - Request: the registry (<account>.dkr.ecr.<region>.amazonaws.com) gets
+//     Basic auth AWS:<mask>; the mask is swapped for the real token.
+//
+// Every swap also calls tctx.MarkCredentialInjected, so a later transform
+// (aws_auth's write policy) can tell a request carrying a proxy-held
+// credential from one the client authorized on its own. This transform only
+// masks and swaps; it never decides whether a request may go out.
 //
 // Fail posture (same as the Python addons):
 //
@@ -84,6 +98,13 @@
 //	            # one token path (/oauth/token and a deviceauth endpoint).
 //	            - host: auth.openai.com
 //	              methods: [POST]
+//	      ecr:
+//	        token_kind: "ecr:token"
+//	        issue_rules:
+//	          - host: api.ecr.af-south-1.amazonaws.com
+//	            methods: [POST]
+//	        consume_rules:
+//	          - host: "*.dkr.ecr.af-south-1.amazonaws.com"
 package credmask
 
 import (
@@ -141,6 +162,17 @@ type config struct {
 	EnforceSource *bool                `yaml:"enforce_source,omitempty"` // default true
 	GitHub        *githubConfig        `yaml:"github,omitempty"`
 	OAuthRefresh  []oauthRefreshConfig `yaml:"oauth_refresh,omitempty"`
+	ECR           *ecrConfig           `yaml:"ecr,omitempty"`
+}
+
+// ecrConfig masks the Amazon ECR registry token. GetAuthorizationToken
+// (issue_rules, the ECR API host) returns a 12-hour token that is the Basic
+// auth password for the registry (consume_rules, the <account>.dkr.ecr
+// host). The client gets a mask; the registry gets the real token.
+type ecrConfig struct {
+	TokenKind    string                 `yaml:"token_kind"`
+	IssueRules   []hostmatch.RuleConfig `yaml:"issue_rules"`
+	ConsumeRules []hostmatch.RuleConfig `yaml:"consume_rules"`
 }
 
 type githubConfig struct {
@@ -185,6 +217,10 @@ type CredMask struct {
 	githubRefreshKind string
 
 	oauth []oauthProvider
+
+	ecrIssue   []hostmatch.Rule // as configured: response masking; nil when ecr is not configured
+	ecrConsume []hostmatch.Rule // require_tls forced on: Basic-auth swap to the registry
+	ecrKind    string
 }
 
 func factory(node yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
@@ -280,8 +316,25 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		m.oauth = append(m.oauth, oauthProvider{kind: p.Kind, field: field, maskPrefix: p.MaskPrefix, rules: rules, swapRules: swapRules})
 	}
 
-	if m.githubConsume == nil && len(m.oauth) == 0 {
-		return nil, errors.New("credential_mask: configure github and/or oauth_refresh")
+	if c.ECR != nil {
+		if len(c.ECR.IssueRules) == 0 || len(c.ECR.ConsumeRules) == 0 {
+			return nil, errors.New("credential_mask: ecr needs both issue_rules and consume_rules")
+		}
+		if err := addKind(c.ECR.TokenKind, "ecr.token_kind"); err != nil {
+			return nil, err
+		}
+		m.ecrKind = c.ECR.TokenKind
+		var err error
+		if m.ecrIssue, err = hostmatch.CompileRules(c.ECR.IssueRules, "credential_mask ecr.issue_rules"); err != nil {
+			return nil, err
+		}
+		if m.ecrConsume, err = hostmatch.CompileRulesAllowRequireTLS(withRequireTLS(c.ECR.ConsumeRules), "credential_mask ecr.consume_rules"); err != nil {
+			return nil, err
+		}
+	}
+
+	if m.githubConsume == nil && len(m.oauth) == 0 && m.ecrIssue == nil {
+		return nil, errors.New("credential_mask: configure github, oauth_refresh and/or ecr")
 	}
 	return m, nil
 }
@@ -350,7 +403,58 @@ func (m *CredMask) TransformRequest(_ context.Context, tctx *transform.Transform
 		}
 	}
 
+	if m.ecrIssue != nil && hostmatch.MatchAnyRule(m.ecrIssue, req) && isECRGetAuthorizationToken(req) {
+		// We must read the token response, so ask for it uncompressed.
+		req.Header.Set("Accept-Encoding", "identity")
+	}
+
+	if m.ecrConsume != nil && hostmatch.MatchAnyRule(m.ecrConsume, req) {
+		m.swapECRAuth(tctx, req)
+	}
+
 	return cont, nil
+}
+
+// isECRGetAuthorizationToken reports whether req is an ECR
+// GetAuthorizationToken call. The ECR API is JSON-RPC: every operation is a
+// POST to the same path, named in X-Amz-Target
+// (AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken). Matched on
+// the operation suffix so an API version bump still masks the token.
+func isECRGetAuthorizationToken(req *http.Request) bool {
+	return req.Method == http.MethodPost &&
+		strings.HasSuffix(req.Header.Get("X-Amz-Target"), ".GetAuthorizationToken")
+}
+
+// swapECRAuth replaces a masked ECR token in a registry request's Basic
+// auth (user "AWS", password = the token) with the real token. Headers
+// only, so a large `docker push` layer upload still streams.
+func (m *CredMask) swapECRAuth(tctx *transform.TransformContext, req *http.Request) {
+	auth := req.Header.Get("Authorization")
+	scheme, value, ok := strings.Cut(auth, " ")
+	if !ok || !strings.EqualFold(scheme, "basic") {
+		return
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(value))
+	if err != nil {
+		return
+	}
+	user, pw, ok := strings.Cut(string(decoded), ":")
+	if !ok {
+		return
+	}
+	real, found, err := m.store.Resolve(pw, m.ecrKind, sourceOf(req), m.enforceSource)
+	if err != nil {
+		// Fail safe: leave the mask; the registry answers 401, nothing leaks.
+		m.logger.Error("credential_mask: store error resolving ecr mask, header left unchanged", slog.String("error", err.Error()))
+		tctx.Annotate("resolve_error", m.ecrKind)
+		return
+	}
+	if !found {
+		return
+	}
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(user+":"+real)))
+	tctx.Annotate("swapped", m.ecrKind)
+	tctx.MarkCredentialInjected("credential_mask")
 }
 
 // swapGitHubAuth replaces a mask in the Authorization header with the real
@@ -409,6 +513,7 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 
 	req.Header.Set("Authorization", newAuth)
 	tctx.Annotate("swapped", "github:authorization")
+	tctx.MarkCredentialInjected("credential_mask")
 }
 
 // swapOAuthRefresh replaces a masked refresh token in a JSON request body.
@@ -453,6 +558,7 @@ func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.
 	req.ContentLength = int64(len(out))
 	req.Header.Set("Content-Length", strconv.Itoa(len(out)))
 	tctx.Annotate("swapped", p.kind)
+	tctx.MarkCredentialInjected("credential_mask")
 	return nil
 }
 
@@ -544,6 +650,7 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 
 	if swapped {
 		tctx.Annotate("swapped", m.githubRefreshKind)
+		tctx.MarkCredentialInjected("credential_mask")
 	}
 	return nil
 }
@@ -604,7 +711,85 @@ func (m *CredMask) TransformResponse(_ context.Context, tctx *transform.Transfor
 		return m.maskOAuthRefresh(tctx, req, resp, p), nil
 	}
 
+	if m.ecrIssue != nil && hostmatch.MatchAnyRule(m.ecrIssue, req) && isECRGetAuthorizationToken(req) {
+		return m.maskECRToken(tctx, req, resp), nil
+	}
+
 	return cont, nil
+}
+
+// maskECRToken masks every token in a GetAuthorizationToken response:
+//
+//	{"authorizationData":[{"authorizationToken":"<base64 of AWS:token>",
+//	  "expiresAt":...,"proxyEndpoint":"https://<account>.dkr.ecr..."}]}
+//
+// Only the token after "AWS:" is masked, and the pair is re-encoded, so
+// the client (aws ecr get-login-password, docker-credential-ecr-login)
+// still decodes it into a user and password.
+func (m *CredMask) maskECRToken(tctx *transform.TransformContext, req *http.Request, resp *http.Response) *transform.TransformResult {
+	cont := &transform.TransformResult{Action: transform.ActionContinue}
+
+	if resp.StatusCode != http.StatusOK {
+		return cont // an error response carries no token
+	}
+	body, err := readDecodedBody(resp, tokenMaxDecodedBytes)
+	if err != nil {
+		return m.abort(tctx, req, m.ecrKind, fmt.Sprintf("cannot read token response: %v", err))
+	}
+	obj, ok := parseJSONObject(body)
+	if !ok {
+		// A 200 that does not parse may be cut short with the token still in it.
+		return m.abort(tctx, req, m.ecrKind, "token response is not a JSON object (truncated?)")
+	}
+	entries, ok := obj["authorizationData"].([]any)
+	if !ok {
+		return m.abort(tctx, req, m.ecrKind, "token response has no authorizationData list")
+	}
+
+	source := sourceOf(req)
+	for i, e := range entries {
+		entry, ok := e.(map[string]any)
+		if !ok {
+			return m.abort(tctx, req, m.ecrKind, fmt.Sprintf("authorizationData[%d] is not an object", i))
+		}
+		encoded, ok := entry["authorizationToken"].(string)
+		if !ok || encoded == "" {
+			return m.abort(tctx, req, m.ecrKind, fmt.Sprintf("authorizationData[%d] has no authorizationToken", i))
+		}
+		decoded, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return m.abort(tctx, req, m.ecrKind, fmt.Sprintf("authorizationData[%d].authorizationToken is not base64", i))
+		}
+		user, token, ok := strings.Cut(string(decoded), ":")
+		if !ok || token == "" {
+			return m.abort(tctx, req, m.ecrKind, fmt.Sprintf("authorizationData[%d].authorizationToken is not user:token", i))
+		}
+		if m.store.IsMask(token) {
+			continue // already a mask; never mask a mask
+		}
+		// The store keeps everything up to a token's last underscore as the
+		// mask's prefix (GitHub's gho_ style). ECR tokens are base64 with no
+		// underscore, so the whole token is randomised. If one ever had an
+		// underscore, most of the real token would stay visible in the mask,
+		// so refuse instead.
+		if strings.Contains(token, "_") {
+			return m.abort(tctx, req, m.ecrKind, fmt.Sprintf("authorizationData[%d] token has unexpected shape (underscore)", i))
+		}
+		mask, err := m.store.Tokenize(token, m.ecrKind, source, "")
+		if err != nil {
+			return m.abort(tctx, req, m.ecrKind, err.Error())
+		}
+		entry["authorizationToken"] = base64.StdEncoding.EncodeToString([]byte(user + ":" + mask))
+	}
+
+	out, err := encodeJSON(obj)
+	if err != nil {
+		return m.abort(tctx, req, m.ecrKind, err.Error())
+	}
+	setResponseBody(resp, out)
+	m.logger.Info("credential_mask: masked ecr token in response", slog.Int("tokens", len(entries)))
+	tctx.Annotate("masked", m.ecrKind)
+	return cont
 }
 
 func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *http.Request, resp *http.Response) *transform.TransformResult {
