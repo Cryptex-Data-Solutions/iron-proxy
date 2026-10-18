@@ -19,7 +19,8 @@
 //  3. Echo re-masking (response). If a response body echoes the real token
 //     we swapped in, it is re-masked before it reaches the client. This is
 //     best effort, a backstop rather than a guarantee: only text-like
-//     bodies known to be at most echoMaxBytes are scanned. Larger bodies,
+//     bodies known to be at most echoMaxBytes, both as sent and once gzip
+//     is decoded, are scanned. Larger bodies,
 //     bodies of unknown length (chunked, HTTP/2 without Content-Length),
 //     SSE streams and binary types (git packfiles) pass through unscanned. Failing closed
 //     on those would block every git fetch and clone, and GitHub does not
@@ -129,6 +130,15 @@ const githubAuthKind = "github:access_token"
 // in memory. text/event-stream is excluded so streams are never buffered.
 // Anything skipped is forwarded unscanned, not rejected: see the package doc.
 const echoMaxBytes = 256 * 1024
+
+// tokenMaxDecodedBytes bounds a decoded login/refresh response. Real token
+// responses are well under 1 KiB; anything larger than this aborts rather
+// than being decompressed into memory.
+const tokenMaxDecodedBytes = 1024 * 1024
+
+// errDecodedTooLarge is returned by readDecodedBody when the decoded body is
+// over its limit.
+var errDecodedTooLarge = errors.New("decoded body is over the size limit")
 
 var echoTextContentTypes = []string{"application/json", "text/", "application/x-www-form-urlencoded"}
 
@@ -551,7 +561,7 @@ func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *htt
 	if resp.StatusCode != http.StatusOK {
 		return cont
 	}
-	body, err := readDecodedBody(resp)
+	body, err := readDecodedBody(resp, tokenMaxDecodedBytes)
 	if err != nil {
 		return m.abort(tctx, req, "github:issue", fmt.Sprintf("cannot read issuance response: %v", err))
 	}
@@ -667,7 +677,13 @@ func (m *CredMask) remaskGitHubEcho(tctx *transform.TransformContext, req *http.
 		return
 	}
 
-	body, err := readDecodedBody(resp)
+	// The check above bounds the compressed size; this bounds the decoded
+	// size, so a small gzip body cannot expand into a huge one in memory.
+	body, err := readDecodedBody(resp, echoMaxBytes)
+	if errors.Is(err, errDecodedTooLarge) {
+		tctx.Annotate("echo_skipped", "too-large-decoded")
+		return
+	}
 	if err != nil {
 		m.logger.Error("credential_mask: echo re-mask read failed", slog.String("error", err.Error()))
 		return
@@ -683,7 +699,7 @@ func (m *CredMask) remaskGitHubEcho(tctx *transform.TransformContext, req *http.
 func (m *CredMask) maskOAuthRefresh(tctx *transform.TransformContext, req *http.Request, resp *http.Response, p *oauthProvider) *transform.TransformResult {
 	cont := &transform.TransformResult{Action: transform.ActionContinue}
 
-	body, err := readDecodedBody(resp)
+	body, err := readDecodedBody(resp, tokenMaxDecodedBytes)
 	if err != nil {
 		return m.abort(tctx, req, p.kind, fmt.Sprintf("cannot read token response: %v", err))
 	}
@@ -762,7 +778,12 @@ func (m *CredMask) abort(tctx *transform.TransformContext, req *http.Request, ki
 // readDecodedBody reads the response body and undoes gzip if present. The
 // pipeline rewinds the buffered body for the next transform, so reading it
 // here is safe. Any encoding other than gzip/identity is an error.
-func readDecodedBody(resp *http.Response) ([]byte, error) {
+//
+// A decoded body longer than limit returns errDecodedTooLarge. For gzip the
+// limit is applied while decompressing, so a small body that expands to a
+// huge one (a decompression bomb) stops at limit+1 bytes instead of filling
+// memory.
+func readDecodedBody(resp *http.Response, limit int64) ([]byte, error) {
 	if resp.Body == nil {
 		return nil, nil
 	}
@@ -773,6 +794,9 @@ func readDecodedBody(resp *http.Response) ([]byte, error) {
 	enc := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding")))
 	switch enc {
 	case "", "identity":
+		if int64(len(raw)) > limit {
+			return nil, errDecodedTooLarge
+		}
 		return raw, nil
 	case "gzip":
 		zr, err := gzip.NewReader(bytes.NewReader(raw))
@@ -780,7 +804,16 @@ func readDecodedBody(resp *http.Response) ([]byte, error) {
 			return nil, fmt.Errorf("gzip: %w", err)
 		}
 		defer zr.Close()
-		return io.ReadAll(zr)
+		// Read one byte past the limit so "exactly at the limit" (fine) can
+		// be told apart from "over the limit".
+		decoded, err := io.ReadAll(io.LimitReader(zr, limit+1))
+		if err != nil {
+			return nil, fmt.Errorf("gzip: %w", err)
+		}
+		if int64(len(decoded)) > limit {
+			return nil, errDecodedTooLarge
+		}
+		return decoded, nil
 	default:
 		return nil, fmt.Errorf("unsupported Content-Encoding %q", enc)
 	}

@@ -449,6 +449,76 @@ func TestEchoSizeBounds(t *testing.T) {
 	}
 }
 
+// A small gzip body can decode to a huge one. The decoded size is bounded
+// too: echo skips (the body passes untouched), login/refresh aborts.
+func TestDecodedSizeLimits(t *testing.T) {
+	echoToken := []byte(`{"token":"` + realGitHub + `"}`)
+	echoAtLimit := append(bytes.Repeat([]byte(" "), echoMaxBytes-len(echoToken)), echoToken...)
+	echoOverLimit := append(bytes.Repeat([]byte(" "), echoMaxBytes), echoToken...)
+	issuanceOverLimit := append(bytes.Repeat([]byte(" "), tokenMaxDecodedBytes), []byte(`{"access_token":"`+realGitHub+`"}`)...)
+	oauthOverLimit := append(bytes.Repeat([]byte(" "), tokenMaxDecodedBytes), []byte(`{"refresh_token":"`+realClaude+`"}`)...)
+
+	tests := []struct {
+		name       string
+		kind       string // "echo", "issuance" or "oauth"
+		decoded    []byte
+		gzip       bool
+		wantReject bool // login/refresh: aborted with a 500
+		wantMasked bool // echo: real token re-masked
+	}{
+		{name: "echo gzip decodes to exactly the limit", kind: "echo", decoded: echoAtLimit, gzip: true, wantMasked: true},
+		{name: "echo gzip decodes past the limit", kind: "echo", decoded: echoOverLimit, gzip: true, wantMasked: false},
+		{name: "issuance gzip decodes past the limit", kind: "issuance", decoded: issuanceOverLimit, gzip: true, wantReject: true},
+		{name: "issuance plain body past the limit", kind: "issuance", decoded: issuanceOverLimit, gzip: false, wantReject: true},
+		{name: "oauth gzip decodes past the limit", kind: "oauth", decoded: oauthOverLimit, gzip: true, wantReject: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m, store := newTestTransform(t)
+
+			var req *http.Request
+			var mask string
+			switch tc.kind {
+			case "echo":
+				req, mask = swappedGitHubRequest(t, m, store)
+			case "issuance":
+				req = newReq("POST", issuePath, nil)
+			case "oauth":
+				req = newReq("POST", claudeToken, nil)
+			}
+
+			upstream := tc.decoded
+			header := http.Header{"Content-Type": {"application/json"}}
+			if tc.gzip {
+				upstream = gzipBytes(t, tc.decoded)
+				header.Set("Content-Encoding", "gzip")
+				require.LessOrEqual(t, len(upstream), echoMaxBytes, "compressed body must pass the compressed-size check")
+			}
+			resp := newResp(req, 200, header, upstream)
+
+			res, err := m.TransformResponse(context.Background(), tctx(), req, resp)
+			require.NoError(t, err)
+
+			if tc.kind != "echo" {
+				if tc.wantReject {
+					require.Equal(t, transform.ActionReject, res.Action)
+					require.Equal(t, http.StatusInternalServerError, res.Response.StatusCode)
+				}
+				return
+			}
+
+			out := readAll(t, resp.Body)
+			if tc.wantMasked {
+				require.NotContains(t, string(out), realGitHub)
+				require.Contains(t, string(out), mask)
+			} else {
+				require.Equal(t, upstream, out, "skipped: the original compressed body goes through as-is")
+			}
+		})
+	}
+}
+
 func TestEchoUnchangedBodyIsLeftAlone(t *testing.T) {
 	m, store := newTestTransform(t)
 	req, _ := swappedGitHubRequest(t, m, store)
