@@ -42,6 +42,30 @@ func TestKind_StoreResolvesOnlyTheMintedKind(t *testing.T) {
 	}
 }
 
+// Reuse is per kind: the same secret and client tokenized under a second
+// kind (say, after an oauth_refresh kind is renamed) gets its own mask, and
+// each mask resolves as its own kind. Tokenizing again under the same kind
+// still returns the existing mask.
+func TestKind_ReuseIsPerKind(t *testing.T) {
+	s := newTestStore(t)
+	first, err := s.Tokenize(realClaude, "claude:refresh", clientIP, "sk-ant-ort01-")
+	require.NoError(t, err)
+	again, err := s.Tokenize(realClaude, "claude:refresh", clientIP, "sk-ant-ort01-")
+	require.NoError(t, err)
+	require.Equal(t, first, again, "same kind reuses the mask")
+
+	renamed, err := s.Tokenize(realClaude, "anthropic:refresh", clientIP, "sk-ant-ort01-")
+	require.NoError(t, err)
+	require.NotEqual(t, first, renamed, "a second kind gets its own mask")
+
+	for mask, kind := range map[string]string{first: "claude:refresh", renamed: "anthropic:refresh"} {
+		real, ok, err := s.Resolve(mask, kind, clientIP, true)
+		require.NoError(t, err)
+		require.True(t, ok, kind)
+		require.Equal(t, realClaude, real)
+	}
+}
+
 func TestKind_RequestSwapsOnlyTheMatchingKind(t *testing.T) {
 	tests := []struct {
 		name        string

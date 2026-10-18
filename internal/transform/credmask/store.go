@@ -142,11 +142,15 @@ func Open(dir string) (*Store, error) {
 	return s, nil
 }
 
-// lookupHMAC is keyed per (source, secret): the same real token seen from
-// two different clients gets two masks, each bound to its own client.
-func (s *Store) lookupHMAC(secret, source string) string {
+// lookupHMAC is keyed per (source, kind, secret): the same real token seen
+// from two different clients gets two masks, each bound to its own client.
+// The kind is part of the key so a mask is only ever reused for the kind it
+// was minted as; otherwise Resolve's kind check would reject the reused mask.
+func (s *Store) lookupHMAC(secret, kind, source string) string {
 	h := hmac.New(sha256.New, s.macKey)
 	h.Write([]byte(source))
+	h.Write([]byte{0})
+	h.Write([]byte(kind))
 	h.Write([]byte{0})
 	h.Write([]byte(secret))
 	return hex.EncodeToString(h.Sum(nil))
@@ -164,7 +168,7 @@ func (s *Store) Tokenize(secret, kind, source, maskPrefix string) (string, error
 		return "", fmt.Errorf("%w: refusing to tokenize without a source identity", ErrStore)
 	}
 
-	lookup := s.lookupHMAC(secret, source)
+	lookup := s.lookupHMAC(secret, kind, source)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
