@@ -633,3 +633,38 @@ tls:
 		require.Contains(t, err.Error(), "control_plane.poll_interval must be positive")
 	})
 }
+
+func TestValidInterceptHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"github.com", true},
+		{"api.github.com", true},
+		{"localhost", true},
+		{"*.amazonaws.com", true},
+		{"*.example", true},
+		{"ssm.af-south-1.amazonaws.com", true},
+		{"GitHub.com", true},
+		{"", false},
+		{"*", false},
+		{"*.", false},
+		{"[github.com", false},
+		{"api-*.example.com", false},
+		{"*.*.example.com", false},
+		{"github.com.", false},
+		{".github.com", false},
+		{"github..com", false},
+		{"-github.com", false},
+		{"github-.com", false},
+		{"https://github.com", false},
+		{"github.com:443", false},
+		{"git hub.com", false},
+		{"github.com/path", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.host, func(t *testing.T) {
+			require.Equal(t, tc.want, validInterceptHost(tc.host))
+		})
+	}
+}

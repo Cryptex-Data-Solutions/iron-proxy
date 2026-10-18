@@ -293,6 +293,32 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
+// validInterceptHost reports whether h is one of the two forms
+// tls.intercept and tls.intercept_exclude support: an exact host name
+// ("github.com") or a leading wildcard ("*.amazonaws.com"). Anything else
+// (other glob syntax, a URL, a port) is rejected at startup: the matcher
+// would treat it as matching nothing, so a host meant to be decrypted
+// would be tunnelled silently.
+func validInterceptHost(h string) bool {
+	name := strings.TrimPrefix(h, "*.")
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			isDigit := c >= '0' && c <= '9'
+			if !isLetter && !isDigit && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // Validate checks required fields and value constraints.
 func Validate(cfg *Config) error {
 	if cfg.DNS.IsEnabled() && cfg.DNS.ProxyIP == "" {
@@ -320,7 +346,7 @@ func Validate(cfg *Config) error {
 		hosts []string
 	}{{"tls.intercept", cfg.TLS.Intercept}, {"tls.intercept_exclude", cfg.TLS.InterceptExclude}} {
 		for i, h := range list.hosts {
-			if strings.TrimSpace(h) == "" || strings.ContainsAny(h, "/: ") {
+			if !validInterceptHost(h) {
 				return fmt.Errorf("%s[%d]: %q is not a host name or *.domain glob", list.name, i, h)
 			}
 		}
