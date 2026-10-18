@@ -211,6 +211,7 @@ func (g *GCPIDToken) TransformRequest(ctx context.Context, tctx *transform.Trans
 	}
 	tctx.Annotate("audience", g.audience)
 	tctx.Annotate("injected", []string{"header:" + g.header})
+	tctx.MarkCredentialInjected(g.Name())
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 

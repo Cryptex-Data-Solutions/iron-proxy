@@ -210,6 +210,7 @@ func (g *GCPAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		tctx.Annotate("service_account", g.principal)
 	}
 	tctx.Annotate("injected", []string{"header:Authorization"})
+	tctx.MarkCredentialInjected(g.Name())
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
 }
 

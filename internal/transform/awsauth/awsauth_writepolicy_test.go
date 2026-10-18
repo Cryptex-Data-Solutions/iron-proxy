@@ -90,12 +90,16 @@ func TestWritePolicy(t *testing.T) {
 			wantResigned: true,
 		},
 		{
-			name:  "foreign-signed read passes untouched",
-			build: func(t *testing.T) *http.Request { return foreignSignedRequest(t, "GET", "https://their-bucket.s3.amazonaws.com/x") },
+			name: "foreign-signed read passes untouched",
+			build: func(t *testing.T) *http.Request {
+				return foreignSignedRequest(t, "GET", "https://their-bucket.s3.amazonaws.com/x")
+			},
 		},
 		{
-			name:       "foreign-signed write is rejected",
-			build:      func(t *testing.T) *http.Request { return foreignSignedRequest(t, "PUT", "https://their-bucket.s3.amazonaws.com/x") },
+			name: "foreign-signed write is rejected",
+			build: func(t *testing.T) *http.Request {
+				return foreignSignedRequest(t, "PUT", "https://their-bucket.s3.amazonaws.com/x")
+			},
 			wantReject: true,
 			wantStatus: http.StatusForbidden,
 		},
@@ -149,8 +153,10 @@ func TestWritePolicy(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:  "unsigned HEAD passes untouched",
-			build: func(t *testing.T) *http.Request { return plainRequest(t, "HEAD", "https://public-bucket.s3.amazonaws.com/x", "") },
+			name: "unsigned HEAD passes untouched",
+			build: func(t *testing.T) *http.Request {
+				return plainRequest(t, "HEAD", "https://public-bucket.s3.amazonaws.com/x", "")
+			},
 		},
 	}
 

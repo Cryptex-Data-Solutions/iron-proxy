@@ -399,6 +399,9 @@ func (s *Secrets) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	if len(injected) > 0 {
 		tctx.Annotate("injected", injected)
 	}
+	if len(swapped) > 0 || len(injected) > 0 {
+		tctx.MarkCredentialInjected(s.Name())
+	}
 	if len(unavailable) > 0 {
 		tctx.Annotate("secret_unavailable", unavailable)
 	}
