@@ -210,23 +210,24 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		}
 	}
 
-	// A mask resolves only as its own kind, so each kind must belong to
-	// exactly one provider. Two entries sharing a kind, or an entry using a
-	// GitHub kind, would let one provider's mask resolve at another
-	// provider's endpoint and send the real credential there.
-	seenKinds := map[string]int{}
+	// A mask resolves only as its own kind, so every kind in use must be
+	// unique: two providers sharing one would let one provider's mask resolve
+	// at the other's endpoint and send the real credential there. All kinds
+	// are checked as one list, wherever they are named: GitHub's are fixed
+	// in code, the oauth_refresh ones come from config.
+	kindsInUse := map[string]string{
+		githubAuthKind:    "github",
+		githubRefreshKind: "github",
+	}
 	for i, p := range c.OAuthRefresh {
 		ctx := fmt.Sprintf("credential_mask oauth_refresh[%d]", i)
 		if p.Kind == "" {
 			return nil, fmt.Errorf("%s: kind is required", ctx)
 		}
-		if strings.HasPrefix(p.Kind, "github:") {
-			return nil, fmt.Errorf("%s: kind %q is reserved for the github section", ctx, p.Kind)
+		if owner, dup := kindsInUse[p.Kind]; dup {
+			return nil, fmt.Errorf("%s: kind %q is already used by %s; every kind must be unique", ctx, p.Kind, owner)
 		}
-		if first, dup := seenKinds[p.Kind]; dup {
-			return nil, fmt.Errorf("%s: kind %q is already used by oauth_refresh[%d]; each provider needs its own kind", ctx, p.Kind, first)
-		}
-		seenKinds[p.Kind] = i
+		kindsInUse[p.Kind] = fmt.Sprintf("oauth_refresh[%d]", i)
 		if p.MaskPrefix == "" {
 			return nil, fmt.Errorf("%s: mask_prefix is required", ctx)
 		}

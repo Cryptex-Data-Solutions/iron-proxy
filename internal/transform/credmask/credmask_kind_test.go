@@ -70,9 +70,9 @@ func TestKind_ReuseIsPerKind(t *testing.T) {
 	}
 }
 
-// Each kind must belong to one provider, or the kind check cannot tell
-// providers apart: config load rejects shared and reserved kinds.
-func TestKind_ConfigRejectsSharedAndReservedKinds(t *testing.T) {
+// Every kind in use must be unique, or the kind check cannot tell providers
+// apart. GitHub's kinds and the oauth_refresh kinds are one list.
+func TestKind_ConfigRejectsDuplicateKinds(t *testing.T) {
 	claude := oauthRefreshConfig{Kind: "claude:refresh", MaskPrefix: "sk-ant-ort01-", Rules: []hostmatch.RuleConfig{{Host: "platform.claude.com"}}}
 	codex := oauthRefreshConfig{Kind: "codex:refresh", MaskPrefix: "rt.1.", Rules: []hostmatch.RuleConfig{{Host: "auth.openai.com"}}}
 	withKind := func(p oauthRefreshConfig, kind string) oauthRefreshConfig { p.Kind = kind; return p }
@@ -84,8 +84,9 @@ func TestKind_ConfigRejectsSharedAndReservedKinds(t *testing.T) {
 	}{
 		{name: "distinct kinds load", entries: []oauthRefreshConfig{claude, codex}},
 		{name: "two providers sharing a kind", entries: []oauthRefreshConfig{withKind(claude, "refresh"), withKind(codex, "refresh")}, wantErr: "already used by oauth_refresh[0]"},
-		{name: "github access token kind", entries: []oauthRefreshConfig{withKind(claude, "github:access_token")}, wantErr: "reserved for the github section"},
-		{name: "github refresh token kind", entries: []oauthRefreshConfig{withKind(claude, "github:refresh_token")}, wantErr: "reserved for the github section"},
+		{name: "github access token kind", entries: []oauthRefreshConfig{withKind(claude, "github:access_token")}, wantErr: "already used by github"},
+		{name: "github refresh token kind", entries: []oauthRefreshConfig{withKind(claude, "github:refresh_token")}, wantErr: "already used by github"},
+		{name: "other github-looking name is just a name", entries: []oauthRefreshConfig{withKind(claude, "github:something-else")}},
 	}
 
 	for _, tc := range tests {
