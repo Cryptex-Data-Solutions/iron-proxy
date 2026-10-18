@@ -106,8 +106,10 @@ func TestTLS_ConfigCannotTurnOffTheSwapGuard(t *testing.T) {
 	c := config{
 		StoreDir: "unused-in-tests",
 		GitHub: &githubConfig{
-			ConsumeRules: []hostmatch.RuleConfig{{Host: "api.github.com", RequireTLS: false}},
-			IssueRules:   []hostmatch.RuleConfig{{Host: "github.com", Methods: []string{"POST"}, Paths: []string{"/login/oauth/access_token"}}},
+			AccessTokenKind:  "github:access_token",
+			RefreshTokenKind: "github:refresh_token",
+			ConsumeRules:     []hostmatch.RuleConfig{{Host: "api.github.com", RequireTLS: false}},
+			IssueRules:       []hostmatch.RuleConfig{{Host: "github.com", Methods: []string{"POST"}, Paths: []string{"/login/oauth/access_token"}}},
 		},
 		OAuthRefresh: []oauthRefreshConfig{
 			{Kind: "claude:refresh", MaskPrefix: "sk-ant-ort01-", Rules: []hostmatch.RuleConfig{{Host: "platform.claude.com", RequireTLS: false}}},

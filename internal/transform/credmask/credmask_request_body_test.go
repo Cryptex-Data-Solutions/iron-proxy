@@ -131,7 +131,7 @@ func TestRequestBody_EncodingIdentityIsPlain(t *testing.T) {
 				body = []byte(`{"grant_type":"refresh_token","refresh_token":"` + mask + `"}`)
 			case "github":
 				real = realGitHubRefresh
-				mask, err = store.Tokenize(real, githubRefreshKind, clientIP, "")
+				mask, err = store.Tokenize(real, "github:refresh_token", clientIP, "")
 				require.NoError(t, err)
 				target = issuePath
 				body = []byte(url.Values{"grant_type": {"refresh_token"}, "refresh_token": {mask}}.Encode())

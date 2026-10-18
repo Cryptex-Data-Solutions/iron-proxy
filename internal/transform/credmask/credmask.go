@@ -58,7 +58,11 @@
 //	    config:
 //	      store_dir: /var/lib/iron-proxy/credmask
 //	      enforce_source: true
+//	      # Every kind below is the label stored on a mask. Each must be
+//	      # unique across the whole config; renaming one orphans its masks.
 //	      github:
+//	        access_token_kind: "github:access_token"
+//	        refresh_token_kind: "github:refresh_token"
 //	        consume_rules:
 //	          - host: github.com
 //	          - host: api.github.com
@@ -114,10 +118,14 @@ var githubTokenPrefixes = []string{"gho_", "ghu_", "ghs_", "ghr_", "ghp_"}
 // githubTokenFields are the issuance body fields that may hold a token.
 var githubTokenFields = []string{"access_token", "refresh_token"}
 
-// githubAuthKind is the only kind swapped into an Authorization header: a
-// masked GitHub access token. A GitHub refresh token, or another provider's
-// credential, is never sent there.
-const githubAuthKind = "github:access_token"
+// githubKindForField is the configured kind a GitHub issuance field is
+// stored as.
+func (m *CredMask) githubKindForField(field string) string {
+	if field == "refresh_token" {
+		return m.githubRefreshKind
+	}
+	return m.githubAccessKind
+}
 
 // tokenMaxDecodedBytes bounds a decoded login/refresh response. Real token
 // responses are well under 1 KiB; anything larger than this aborts rather
@@ -136,8 +144,12 @@ type config struct {
 }
 
 type githubConfig struct {
-	ConsumeRules []hostmatch.RuleConfig `yaml:"consume_rules"`
-	IssueRules   []hostmatch.RuleConfig `yaml:"issue_rules"`
+	// The kinds GitHub masks are stored as, like oauth_refresh's kind. Both
+	// are required. Renaming one orphans the masks stored under the old name.
+	AccessTokenKind  string                 `yaml:"access_token_kind"`
+	RefreshTokenKind string                 `yaml:"refresh_token_kind"`
+	ConsumeRules     []hostmatch.RuleConfig `yaml:"consume_rules"`
+	IssueRules       []hostmatch.RuleConfig `yaml:"issue_rules"`
 }
 
 type oauthRefreshConfig struct {
@@ -164,7 +176,15 @@ type CredMask struct {
 	githubConsume []hostmatch.Rule // require_tls forced on; nil when github is not configured
 	githubIssue   []hostmatch.Rule // as configured: response masking
 	githubRefresh []hostmatch.Rule // issue rules with require_tls forced on: refresh_token swap
-	oauth         []oauthProvider
+
+	// githubAccessKind is the only kind swapped into an Authorization header:
+	// a masked GitHub access token. A GitHub refresh token, or another
+	// provider's credential, is never sent there. githubRefreshKind is the
+	// kind swapped back into a GitHub token refresh. Both come from config.
+	githubAccessKind  string
+	githubRefreshKind string
+
+	oauth []oauthProvider
 }
 
 func factory(node yaml.Node, logger *slog.Logger) (transform.Transformer, error) {
@@ -194,10 +214,34 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		logger:        logger,
 	}
 
+	// A mask resolves only as its own kind, so every kind in the config must
+	// be unique: two providers sharing one would let one provider's mask
+	// resolve at the other's endpoint and send the real credential there.
+	// kindsInUse maps each kind to where it was configured.
+	kindsInUse := map[string]string{}
+	addKind := func(kind, where string) error {
+		if kind == "" {
+			return fmt.Errorf("credential_mask %s is required", where)
+		}
+		if owner, dup := kindsInUse[kind]; dup {
+			return fmt.Errorf("credential_mask %s: kind %q is already used by %s; every kind must be unique", where, kind, owner)
+		}
+		kindsInUse[kind] = where
+		return nil
+	}
+
 	if c.GitHub != nil {
 		if len(c.GitHub.ConsumeRules) == 0 || len(c.GitHub.IssueRules) == 0 {
 			return nil, errors.New("credential_mask: github needs both consume_rules and issue_rules")
 		}
+		if err := addKind(c.GitHub.AccessTokenKind, "github.access_token_kind"); err != nil {
+			return nil, err
+		}
+		if err := addKind(c.GitHub.RefreshTokenKind, "github.refresh_token_kind"); err != nil {
+			return nil, err
+		}
+		m.githubAccessKind = c.GitHub.AccessTokenKind
+		m.githubRefreshKind = c.GitHub.RefreshTokenKind
 		var err error
 		if m.githubConsume, err = hostmatch.CompileRulesAllowRequireTLS(withRequireTLS(c.GitHub.ConsumeRules), "credential_mask github.consume_rules"); err != nil {
 			return nil, err
@@ -210,24 +254,11 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		}
 	}
 
-	// A mask resolves only as its own kind, so every kind in use must be
-	// unique: two providers sharing one would let one provider's mask resolve
-	// at the other's endpoint and send the real credential there. All kinds
-	// are checked as one list, wherever they are named: GitHub's are fixed
-	// in code, the oauth_refresh ones come from config.
-	kindsInUse := map[string]string{
-		githubAuthKind:    "github",
-		githubRefreshKind: "github",
-	}
 	for i, p := range c.OAuthRefresh {
 		ctx := fmt.Sprintf("credential_mask oauth_refresh[%d]", i)
-		if p.Kind == "" {
-			return nil, fmt.Errorf("%s: kind is required", ctx)
+		if err := addKind(p.Kind, fmt.Sprintf("oauth_refresh[%d].kind", i)); err != nil {
+			return nil, err
 		}
-		if owner, dup := kindsInUse[p.Kind]; dup {
-			return nil, fmt.Errorf("%s: kind %q is already used by %s; every kind must be unique", ctx, p.Kind, owner)
-		}
-		kindsInUse[p.Kind] = fmt.Sprintf("oauth_refresh[%d]", i)
 		if p.MaskPrefix == "" {
 			return nil, fmt.Errorf("%s: mask_prefix is required", ctx)
 		}
@@ -339,7 +370,7 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 	var newAuth string
 	switch strings.ToLower(scheme) {
 	case "token", "bearer":
-		real, found, err := m.store.Resolve(value, githubAuthKind, source, m.enforceSource)
+		real, found, err := m.store.Resolve(value, m.githubAccessKind, source, m.enforceSource)
 		if err != nil {
 			// Fail safe: leave the mask; upstream answers 401, nothing leaks.
 			m.logger.Error("credential_mask: store error resolving github mask, header left unchanged", slog.String("error", err.Error()))
@@ -361,7 +392,7 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 		if !ok {
 			return
 		}
-		real, found, err := m.store.Resolve(pw, githubAuthKind, source, m.enforceSource)
+		real, found, err := m.store.Resolve(pw, m.githubAccessKind, source, m.enforceSource)
 		if err != nil {
 			m.logger.Error("credential_mask: store error resolving github basic-auth mask, header left unchanged", slog.String("error", err.Error()))
 			tctx.Annotate("resolve_error", "github")
@@ -460,16 +491,14 @@ func readRefreshRequestBody(req *http.Request) ([]byte, bool, error) {
 	return data, true, nil
 }
 
-// githubRefreshKind is the kind swapped back into a GitHub token refresh
-// (grant_type=refresh_token). GitHub documents the refresh_token as a query
-// parameter; clients also send it in a form or JSON body. All three are
-// handled. The query is safe to rewrite: the audit log records the path
-// only, never the query.
-const githubRefreshKind = "github:refresh_token"
-
 // swapGitHubRefresh replaces a masked GitHub refresh token with the real one
 // in a refresh request to the issuance endpoint. Without it, GitHub App user
 // tokens (which expire) could never be refreshed through the proxy.
+//
+// GitHub documents the refresh_token as a query parameter
+// (grant_type=refresh_token); clients also send it in a form or JSON body.
+// All three are handled. The query is safe to rewrite: the audit log records
+// the path only, never the query.
 //
 // The only error returned is a failed read of the client's body: the request
 // must then fail (502) rather than go upstream with part of its body.
@@ -480,10 +509,10 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 	// 1. Query string.
 	query := req.URL.Query()
 	if mask := query.Get("refresh_token"); mask != "" {
-		real, found, err := m.store.Resolve(mask, githubRefreshKind, source, m.enforceSource)
+		real, found, err := m.store.Resolve(mask, m.githubRefreshKind, source, m.enforceSource)
 		if err != nil {
 			m.logger.Error("credential_mask: store error resolving github refresh mask in query, left unchanged", slog.String("error", err.Error()))
-			tctx.Annotate("resolve_error", githubRefreshKind)
+			tctx.Annotate("resolve_error", m.githubRefreshKind)
 			return nil
 		}
 		if found {
@@ -502,7 +531,7 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 		out, bodySwapped, err := m.swapGitHubRefreshInBody(req.Header.Get("Content-Type"), data, source)
 		if err != nil {
 			m.logger.Error("credential_mask: swapping github refresh mask in body failed, left unchanged", slog.String("error", err.Error()))
-			tctx.Annotate("resolve_error", githubRefreshKind)
+			tctx.Annotate("resolve_error", m.githubRefreshKind)
 			return nil
 		}
 		if bodySwapped {
@@ -514,7 +543,7 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 	}
 
 	if swapped {
-		tctx.Annotate("swapped", githubRefreshKind)
+		tctx.Annotate("swapped", m.githubRefreshKind)
 	}
 	return nil
 }
@@ -532,7 +561,7 @@ func (m *CredMask) swapGitHubRefreshInBody(contentType string, data []byte, sour
 		if !ok || mask == "" {
 			return nil, false, nil
 		}
-		real, found, err := m.store.Resolve(mask, githubRefreshKind, source, m.enforceSource)
+		real, found, err := m.store.Resolve(mask, m.githubRefreshKind, source, m.enforceSource)
 		if err != nil || !found {
 			return nil, false, err
 		}
@@ -552,7 +581,7 @@ func (m *CredMask) swapGitHubRefreshInBody(contentType string, data []byte, sour
 	if mask == "" {
 		return nil, false, nil
 	}
-	real, found, err := m.store.Resolve(mask, githubRefreshKind, source, m.enforceSource)
+	real, found, err := m.store.Resolve(mask, m.githubRefreshKind, source, m.enforceSource)
 	if err != nil || !found {
 		return nil, false, err
 	}
@@ -614,7 +643,7 @@ func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *htt
 				// it through would leak it, so abort instead.
 				return m.abort(tctx, req, "github:issue", fmt.Sprintf("%s has unexpected shape (unknown prefix)", field))
 			}
-			mask, err := m.store.Tokenize(val, "github:"+field, source, "")
+			mask, err := m.store.Tokenize(val, m.githubKindForField(field), source, "")
 			if err != nil {
 				return m.abort(tctx, req, "github:issue", err.Error())
 			}
@@ -640,7 +669,7 @@ func (m *CredMask) maskGitHubIssuance(tctx *transform.TransformContext, req *htt
 			if !hasAnyPrefix(val, githubTokenPrefixes) {
 				return m.abort(tctx, req, "github:issue", fmt.Sprintf("%s has unexpected shape (unknown prefix)", field))
 			}
-			mask, err := m.store.Tokenize(val, "github:"+field, source, "")
+			mask, err := m.store.Tokenize(val, m.githubKindForField(field), source, "")
 			if err != nil {
 				return m.abort(tctx, req, "github:issue", err.Error())
 			}

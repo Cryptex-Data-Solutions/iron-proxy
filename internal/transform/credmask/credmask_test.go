@@ -38,8 +38,10 @@ func newTestTransform(t *testing.T) (*CredMask, *Store) {
 	c := config{
 		StoreDir: "unused-in-tests",
 		GitHub: &githubConfig{
-			ConsumeRules: []hostmatch.RuleConfig{{Host: "github.com"}, {Host: "api.github.com"}},
-			IssueRules:   []hostmatch.RuleConfig{{Host: "github.com", Methods: []string{"POST"}, Paths: []string{"/login/oauth/access_token"}}},
+			AccessTokenKind:  "github:access_token",
+			RefreshTokenKind: "github:refresh_token",
+			ConsumeRules:     []hostmatch.RuleConfig{{Host: "github.com"}, {Host: "api.github.com"}},
+			IssueRules:       []hostmatch.RuleConfig{{Host: "github.com", Methods: []string{"POST"}, Paths: []string{"/login/oauth/access_token"}}},
 		},
 		OAuthRefresh: []oauthRefreshConfig{
 			{Kind: "claude:refresh", MaskPrefix: "sk-ant-ort01-", Rules: []hostmatch.RuleConfig{{Host: "platform.claude.com", Methods: []string{"POST"}, Paths: []string{"/v1/oauth/token"}}}},
@@ -557,6 +559,8 @@ func TestFactoryBuildsFromYAML(t *testing.T) {
 	cfg := `
 store_dir: ` + newStoreDir(t) + `
 github:
+  access_token_kind: "github:access_token"
+  refresh_token_kind: "github:refresh_token"
   consume_rules: [{host: github.com}, {host: api.github.com}]
   issue_rules: [{host: github.com, methods: [POST], paths: [/login/oauth/access_token]}]
 oauth_refresh:
