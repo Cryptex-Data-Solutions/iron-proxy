@@ -377,7 +377,7 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 
 // swapOAuthRefresh replaces a masked refresh token in a JSON request body.
 func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.Request, p *oauthProvider) {
-	if req.Body == nil || req.Header.Get("Content-Encoding") != "" {
+	if req.Body == nil || !bodyIsUnencoded(req.Header) {
 		return
 	}
 	data, err := io.ReadAll(req.Body)
@@ -447,7 +447,7 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 	}
 
 	// 2. Body: form-encoded or JSON.
-	if req.Body != nil && req.Header.Get("Content-Encoding") == "" {
+	if req.Body != nil && bodyIsUnencoded(req.Header) {
 		data, err := io.ReadAll(req.Body)
 		if err == nil && len(data) > 0 {
 			out, bodySwapped, err := m.swapGitHubRefreshInBody(req.Header.Get("Content-Type"), data, source)
@@ -779,6 +779,14 @@ func encodeJSON(obj map[string]any) ([]byte, error) {
 		return nil, err
 	}
 	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// bodyIsUnencoded reports whether a request body is plain bytes: no
+// Content-Encoding, or the no-op "identity". A compressed request body is
+// left alone (the mask goes upstream and the refresh fails safely).
+func bodyIsUnencoded(h http.Header) bool {
+	enc := strings.ToLower(strings.TrimSpace(h.Get("Content-Encoding")))
+	return enc == "" || enc == "identity"
 }
 
 func hasAnyPrefix(s string, prefixes []string) bool {
