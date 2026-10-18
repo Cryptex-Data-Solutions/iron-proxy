@@ -299,7 +299,9 @@ func (m *CredMask) TransformRequest(_ context.Context, tctx *transform.Transform
 	}
 
 	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubRefresh, req) {
-		m.swapGitHubRefresh(tctx, req)
+		if err := m.swapGitHubRefresh(tctx, req); err != nil {
+			return nil, err
+		}
 	}
 
 	if m.githubConsume != nil && hostmatch.MatchAnyRule(m.githubConsume, req) {
@@ -310,7 +312,9 @@ func (m *CredMask) TransformRequest(_ context.Context, tctx *transform.Transform
 		// Asked for uncompressed on plain HTTP too: the response is still masked.
 		req.Header.Set("Accept-Encoding", "identity")
 		if hostmatch.MatchAnyRule(p.swapRules, req) {
-			m.swapOAuthRefresh(tctx, req, p)
+			if err := m.swapOAuthRefresh(tctx, req, p); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -376,21 +380,24 @@ func (m *CredMask) swapGitHubAuth(tctx *transform.TransformContext, req *http.Re
 }
 
 // swapOAuthRefresh replaces a masked refresh token in a JSON request body.
-func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.Request, p *oauthProvider) {
-	if req.Body == nil || !bodyIsUnencoded(req.Header) {
-		return
+//
+// The only error returned is a failed read of the client's body: the request
+// must then fail (502) rather than go upstream with part of its body.
+func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.Request, p *oauthProvider) error {
+	data, ok, err := readRefreshRequestBody(req)
+	if err != nil {
+		return err
 	}
-	data, err := io.ReadAll(req.Body)
-	if err != nil || len(data) == 0 {
-		return
+	if !ok {
+		return nil
 	}
 	obj, ok := parseJSONObject(data)
 	if !ok {
-		return
+		return nil
 	}
 	val, ok := obj[p.field].(string)
 	if !ok || val == "" {
-		return
+		return nil
 	}
 	real, found, err := m.store.Resolve(val, p.kind, sourceOf(req), m.enforceSource)
 	if err != nil {
@@ -398,22 +405,58 @@ func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.
 		m.logger.Error("credential_mask: store error resolving refresh mask, left unchanged",
 			slog.String("kind", p.kind), slog.String("error", err.Error()))
 		tctx.Annotate("resolve_error", p.kind)
-		return
+		return nil
 	}
 	if !found {
-		return
+		return nil
 	}
 	obj[p.field] = real
 	out, err := encodeJSON(obj)
 	if err != nil {
 		m.logger.Error("credential_mask: re-encoding refresh request failed, left unchanged",
 			slog.String("kind", p.kind), slog.String("error", err.Error()))
-		return
+		return nil
 	}
 	req.Body = transform.NewBufferedBodyFromBytes(out)
 	req.ContentLength = int64(len(out))
 	req.Header.Set("Content-Length", strconv.Itoa(len(out)))
 	tctx.Annotate("swapped", p.kind)
+	return nil
+}
+
+// refreshRequestMaxBytes bounds a request body the refresh swaps will read.
+// Real refresh requests are a few hundred bytes. A larger declared body is
+// left alone, unread: reading it would make the pipeline's BufferedBody
+// truncate it at proxy.max_request_body_bytes, and the cut body would be
+// forwarded. The mask then goes upstream unswapped, which is the safe
+// direction.
+const refreshRequestMaxBytes = 1024 * 1024
+
+// readRefreshRequestBody reads a request body for a refresh swap.
+//
+// ok=false means leave the request alone: no body, an empty body, a
+// compressed body, or a declared Content-Length over refreshRequestMaxBytes
+// (not read at all). A body of unknown length is read: refresh clients send
+// a Content-Length.
+//
+// An error means the client's body failed mid-read. BufferedBody has already
+// kept the part it got, so the caller must fail the request instead of
+// forwarding a partial body.
+func readRefreshRequestBody(req *http.Request) ([]byte, bool, error) {
+	if req.Body == nil || !bodyIsUnencoded(req.Header) {
+		return nil, false, nil
+	}
+	if req.ContentLength > refreshRequestMaxBytes {
+		return nil, false, nil
+	}
+	data, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, false, fmt.Errorf("credential_mask: reading refresh request body: %w", err)
+	}
+	if len(data) == 0 {
+		return nil, false, nil
+	}
+	return data, true, nil
 }
 
 // githubRefreshKind is the kind swapped back into a GitHub token refresh
@@ -426,7 +469,10 @@ const githubRefreshKind = "github:refresh_token"
 // swapGitHubRefresh replaces a masked GitHub refresh token with the real one
 // in a refresh request to the issuance endpoint. Without it, GitHub App user
 // tokens (which expire) could never be refreshed through the proxy.
-func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http.Request) {
+//
+// The only error returned is a failed read of the client's body: the request
+// must then fail (502) rather than go upstream with part of its body.
+func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http.Request) error {
 	source := sourceOf(req)
 	swapped := false
 
@@ -437,7 +483,7 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 		if err != nil {
 			m.logger.Error("credential_mask: store error resolving github refresh mask in query, left unchanged", slog.String("error", err.Error()))
 			tctx.Annotate("resolve_error", githubRefreshKind)
-			return
+			return nil
 		}
 		if found {
 			query.Set("refresh_token", real)
@@ -447,27 +493,29 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 	}
 
 	// 2. Body: form-encoded or JSON.
-	if req.Body != nil && bodyIsUnencoded(req.Header) {
-		data, err := io.ReadAll(req.Body)
-		if err == nil && len(data) > 0 {
-			out, bodySwapped, err := m.swapGitHubRefreshInBody(req.Header.Get("Content-Type"), data, source)
-			if err != nil {
-				m.logger.Error("credential_mask: swapping github refresh mask in body failed, left unchanged", slog.String("error", err.Error()))
-				tctx.Annotate("resolve_error", githubRefreshKind)
-				return
-			}
-			if bodySwapped {
-				req.Body = transform.NewBufferedBodyFromBytes(out)
-				req.ContentLength = int64(len(out))
-				req.Header.Set("Content-Length", strconv.Itoa(len(out)))
-				swapped = true
-			}
+	data, ok, err := readRefreshRequestBody(req)
+	if err != nil {
+		return err
+	}
+	if ok {
+		out, bodySwapped, err := m.swapGitHubRefreshInBody(req.Header.Get("Content-Type"), data, source)
+		if err != nil {
+			m.logger.Error("credential_mask: swapping github refresh mask in body failed, left unchanged", slog.String("error", err.Error()))
+			tctx.Annotate("resolve_error", githubRefreshKind)
+			return nil
+		}
+		if bodySwapped {
+			req.Body = transform.NewBufferedBodyFromBytes(out)
+			req.ContentLength = int64(len(out))
+			req.Header.Set("Content-Length", strconv.Itoa(len(out)))
+			swapped = true
 		}
 	}
 
 	if swapped {
 		tctx.Annotate("swapped", githubRefreshKind)
 	}
+	return nil
 }
 
 // swapGitHubRefreshInBody returns the body with a masked refresh_token
