@@ -2,9 +2,13 @@ package credmask
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ironsh/iron-proxy/internal/hostmatch"
 )
 
 // A mask resolves only as the kind it was minted as, so one provider's
@@ -63,6 +67,37 @@ func TestKind_ReuseIsPerKind(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, ok, kind)
 		require.Equal(t, realClaude, real)
+	}
+}
+
+// Each kind must belong to one provider, or the kind check cannot tell
+// providers apart: config load rejects shared and reserved kinds.
+func TestKind_ConfigRejectsSharedAndReservedKinds(t *testing.T) {
+	claude := oauthRefreshConfig{Kind: "claude:refresh", MaskPrefix: "sk-ant-ort01-", Rules: []hostmatch.RuleConfig{{Host: "platform.claude.com"}}}
+	codex := oauthRefreshConfig{Kind: "codex:refresh", MaskPrefix: "rt.1.", Rules: []hostmatch.RuleConfig{{Host: "auth.openai.com"}}}
+	withKind := func(p oauthRefreshConfig, kind string) oauthRefreshConfig { p.Kind = kind; return p }
+
+	tests := []struct {
+		name    string
+		entries []oauthRefreshConfig
+		wantErr string // "" = config loads
+	}{
+		{name: "distinct kinds load", entries: []oauthRefreshConfig{claude, codex}},
+		{name: "two providers sharing a kind", entries: []oauthRefreshConfig{withKind(claude, "refresh"), withKind(codex, "refresh")}, wantErr: "already used by oauth_refresh[0]"},
+		{name: "github access token kind", entries: []oauthRefreshConfig{withKind(claude, "github:access_token")}, wantErr: "reserved for the github section"},
+		{name: "github refresh token kind", entries: []oauthRefreshConfig{withKind(claude, "github:refresh_token")}, wantErr: "reserved for the github section"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := config{StoreDir: "unused-in-tests", OAuthRefresh: tc.entries}
+			_, err := newFromConfig(c, newTestStore(t), slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, tc.wantErr)
+		})
 	}
 }
 

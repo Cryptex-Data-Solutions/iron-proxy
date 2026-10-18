@@ -210,11 +210,23 @@ func newFromConfig(c config, store *Store, logger *slog.Logger) (*CredMask, erro
 		}
 	}
 
+	// A mask resolves only as its own kind, so each kind must belong to
+	// exactly one provider. Two entries sharing a kind, or an entry using a
+	// GitHub kind, would let one provider's mask resolve at another
+	// provider's endpoint and send the real credential there.
+	seenKinds := map[string]int{}
 	for i, p := range c.OAuthRefresh {
 		ctx := fmt.Sprintf("credential_mask oauth_refresh[%d]", i)
 		if p.Kind == "" {
 			return nil, fmt.Errorf("%s: kind is required", ctx)
 		}
+		if strings.HasPrefix(p.Kind, "github:") {
+			return nil, fmt.Errorf("%s: kind %q is reserved for the github section", ctx, p.Kind)
+		}
+		if first, dup := seenKinds[p.Kind]; dup {
+			return nil, fmt.Errorf("%s: kind %q is already used by oauth_refresh[%d]; each provider needs its own kind", ctx, p.Kind, first)
+		}
+		seenKinds[p.Kind] = i
 		if p.MaskPrefix == "" {
 			return nil, fmt.Errorf("%s: mask_prefix is required", ctx)
 		}
