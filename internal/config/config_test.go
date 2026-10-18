@@ -137,6 +137,41 @@ log:
 			wantErr: "unknown log level",
 		},
 		{
+			name: "intercept list in sni-only mode",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  mode: sni-only
+  intercept: ["github.com"]
+`,
+			wantErr: "only apply in \"mitm\" mode",
+		},
+		{
+			name: "intercept entry is a URL, not a host",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  intercept: ["https://github.com"]
+`,
+			wantErr: "tls.intercept[0]",
+		},
+		{
+			name: "intercept_exclude entry has a port",
+			yaml: `
+dns:
+  proxy_ip: "10.0.0.1"
+tls:
+  ca_cert: "/tmp/ca.crt"
+  ca_key: "/tmp/ca.key"
+  intercept_exclude: ["ssm.af-south-1.amazonaws.com:443"]
+`,
+			wantErr: "tls.intercept_exclude[0]",
+		},
+		{
 			name: "dns record missing name",
 			yaml: `
 dns:
@@ -597,4 +632,39 @@ tls:
 		require.Error(t, err)
 		require.Contains(t, err.Error(), "control_plane.poll_interval must be positive")
 	})
+}
+
+func TestValidInterceptHost(t *testing.T) {
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"github.com", true},
+		{"api.github.com", true},
+		{"localhost", true},
+		{"*.amazonaws.com", true},
+		{"*.example", true},
+		{"ssm.af-south-1.amazonaws.com", true},
+		{"GitHub.com", true},
+		{"", false},
+		{"*", false},
+		{"*.", false},
+		{"[github.com", false},
+		{"api-*.example.com", false},
+		{"*.*.example.com", false},
+		{"github.com.", false},
+		{".github.com", false},
+		{"github..com", false},
+		{"-github.com", false},
+		{"github-.com", false},
+		{"https://github.com", false},
+		{"github.com:443", false},
+		{"git hub.com", false},
+		{"github.com/path", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.host, func(t *testing.T) {
+			require.Equal(t, tc.want, validInterceptHost(tc.host))
+		})
+	}
 }

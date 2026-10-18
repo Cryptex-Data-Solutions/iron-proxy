@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -139,7 +140,18 @@ type TLS struct {
 	// CA, and run the full request/response pipeline.
 	// "sni-only": peek the ClientHello SNI, run the pipeline with a host-only
 	// synthetic request, and TCP-passthrough to the upstream. No CA required.
-	Mode                string `yaml:"mode"`
+	Mode string `yaml:"mode"`
+
+	// Intercept, in mitm mode, limits TLS interception to these hosts
+	// (exact names or "*.example.com" globs, matched against the ClientHello
+	// SNI). Every other host is tunnelled like sni-only mode: the pipeline
+	// runs on the SNI alone and the bytes are passed through undecrypted.
+	// Empty means intercept every host (the default).
+	Intercept []string `yaml:"intercept,omitempty"`
+	// InterceptExclude, in mitm mode, names hosts that are never
+	// intercepted, even when Intercept (or the empty default) covers them.
+	InterceptExclude []string `yaml:"intercept_exclude,omitempty"`
+
 	CACert              string `yaml:"ca_cert"`
 	CAKey               string `yaml:"ca_key"`
 	CertCacheSize       int    `yaml:"cert_cache_size"`
@@ -281,6 +293,32 @@ func applyDefaults(cfg *Config) {
 	}
 }
 
+// validInterceptHost reports whether h is one of the two forms
+// tls.intercept and tls.intercept_exclude support: an exact host name
+// ("github.com") or a leading wildcard ("*.amazonaws.com"). Anything else
+// (other glob syntax, a URL, a port) is rejected at startup: the matcher
+// would treat it as matching nothing, so a host meant to be decrypted
+// would be tunnelled silently.
+func validInterceptHost(h string) bool {
+	name := strings.TrimPrefix(h, "*.")
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			isLetter := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+			isDigit := c >= '0' && c <= '9'
+			if !isLetter && !isDigit && c != '-' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // Validate checks required fields and value constraints.
 func Validate(cfg *Config) error {
 	if cfg.DNS.IsEnabled() && cfg.DNS.ProxyIP == "" {
@@ -297,8 +335,21 @@ func Validate(cfg *Config) error {
 		}
 	case TLSModeSNIOnly:
 		// CA cert/key are ignored in sni-only mode; no requirement.
+		if len(cfg.TLS.Intercept) > 0 || len(cfg.TLS.InterceptExclude) > 0 {
+			return fmt.Errorf("tls.intercept and tls.intercept_exclude only apply in %q mode; sni-only never intercepts", TLSModeMITM)
+		}
 	default:
 		return fmt.Errorf("tls.mode must be %q or %q; got %q", TLSModeMITM, TLSModeSNIOnly, cfg.TLS.Mode)
+	}
+	for _, list := range []struct {
+		name  string
+		hosts []string
+	}{{"tls.intercept", cfg.TLS.Intercept}, {"tls.intercept_exclude", cfg.TLS.InterceptExclude}} {
+		for i, h := range list.hosts {
+			if !validInterceptHost(h) {
+				return fmt.Errorf("%s[%d]: %q is not a host name or *.domain glob", list.name, i, h)
+			}
+		}
 	}
 
 	if _, err := parseLogLevel(cfg.Log.Level); err != nil {

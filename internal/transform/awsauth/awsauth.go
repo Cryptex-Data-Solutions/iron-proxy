@@ -249,6 +249,15 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}
 
+	// A connection the proxy does not decrypt (sni-only mode, or a host left
+	// out of tls.intercept) reaches the pipeline as a host-only stand-in
+	// request. There is nothing to sign and nothing to see, so let it pass:
+	// rejecting it would make any host under these rules impossible to
+	// tunnel. Whatever the client signed goes upstream unchanged.
+	if tctx.Mode == transform.ModeSNIOnly {
+		return &transform.TransformResult{Action: transform.ActionContinue}, nil
+	}
+
 	if !hostmatch.MatchAnyRule(a.rules, req) {
 		return &transform.TransformResult{Action: transform.ActionContinue}, nil
 	}

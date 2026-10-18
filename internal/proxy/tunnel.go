@@ -378,6 +378,11 @@ func (p *Proxy) serveTunnelTLS(clientConn net.Conn, target string, tunnelInfo *t
 	if p.tlsMode == config.TLSModeSNIOnly {
 		return p.serveSNIPassthrough(clientConn)
 	}
+	if p.selectiveIntercept() {
+		return p.serveSelectiveTLS(clientConn, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p.handleHTTP(w, r, tunnelInfo)
+		}))
+	}
 
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		GetCertificate: p.getCertificate,

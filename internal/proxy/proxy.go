@@ -23,6 +23,7 @@ import (
 	"github.com/ironsh/iron-proxy/internal/certcache"
 	"github.com/ironsh/iron-proxy/internal/config"
 	"github.com/ironsh/iron-proxy/internal/dnsguard"
+	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/mcp"
 	"github.com/ironsh/iron-proxy/internal/mcpgateway"
 	"github.com/ironsh/iron-proxy/internal/responseretry"
@@ -63,6 +64,11 @@ type Proxy struct {
 	// allowlisted hostname onto a different port. Overridable in tests.
 	sniUpstreamPort string
 	ready           func() bool
+
+	// interceptHosts / interceptExclude make MITM selective (see
+	// shouldIntercept). Both nil means intercept every host.
+	interceptHosts   *hostmatch.Matcher
+	interceptExclude *hostmatch.Matcher
 }
 
 const notReadyMessage = "proxy is not ready: awaiting control-plane config"
@@ -97,6 +103,12 @@ type Options struct {
 	// requests can never pass through un-transformed (leaking placeholder
 	// credentials upstream) during startup.
 	Ready func() bool
+	// InterceptHosts and InterceptExclude make MITM selective (tls.intercept
+	// and tls.intercept_exclude). A TLS connection whose SNI is not
+	// intercepted is tunnelled undecrypted, as in sni-only mode. Both empty
+	// means intercept every host. Ignored in sni-only mode.
+	InterceptHosts   []string
+	InterceptExclude []string
 }
 
 // New creates a new Proxy. In TLSModeMITM, certCache must be non-nil. In
@@ -127,6 +139,13 @@ func New(opts Options) *Proxy {
 		logger:               opts.Logger,
 		shutdownCtx:          shutdownCtx,
 		shutdownCancel:       shutdownCancel,
+	}
+	// hostmatch.New only fails on CIDRs, and none are passed.
+	if len(opts.InterceptHosts) > 0 {
+		p.interceptHosts, _ = hostmatch.New(opts.InterceptHosts, nil)
+	}
+	if len(opts.InterceptExclude) > 0 {
+		p.interceptExclude, _ = hostmatch.New(opts.InterceptExclude, nil)
 	}
 
 	p.httpServer = &http.Server{
@@ -168,9 +187,12 @@ func (p *Proxy) ListenAndServe() error {
 	}()
 
 	go func() {
-		if p.tlsMode == config.TLSModeSNIOnly {
+		switch {
+		case p.tlsMode == config.TLSModeSNIOnly:
 			errc <- p.serveHTTPSSNI()
-		} else {
+		case p.selectiveIntercept():
+			errc <- p.serveHTTPSSelective()
+		default:
 			errc <- p.serveHTTPSMITM()
 		}
 	}()

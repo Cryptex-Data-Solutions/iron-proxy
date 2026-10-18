@@ -86,6 +86,17 @@ tls:
   # only thing that can match. Body-inspecting transforms like secrets and
   # grpc still run, but have nothing to act on.
   mode: "mitm"
+  # Optional, mitm mode only: decrypt only these hosts (exact names or
+  # "*.domain" globs, matched against the ClientHello SNI). Every other host
+  # is tunnelled as in sni-only mode: the allowlist still applies to its SNI,
+  # but nothing is decrypted. intercept_exclude removes hosts even when
+  # intercept (or the default of "everything") covers them. Leave both unset
+  # to decrypt every host.
+  # intercept:
+  #   - "github.com"
+  #   - "*.amazonaws.com"
+  # intercept_exclude:
+  #   - "ssm.us-east-1.amazonaws.com"
   ca_cert: "/etc/iron-proxy/ca.crt"
   ca_key: "/etc/iron-proxy/ca.key"
   cert_cache_size: 1000
