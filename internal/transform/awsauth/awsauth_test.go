@@ -540,6 +540,24 @@ func TestTransformRequestSignsEscapedS3PathsWithoutReescaping(t *testing.T) {
 			disableURIPathEscaping: true,
 		},
 		{
+			name:                   "s3 object lambda key with spaces",
+			url:                    "https://ap-123456789012.s3-object-lambda.us-east-1.amazonaws.com/JULY%2027.zip",
+			service:                "s3-object-lambda",
+			disableURIPathEscaping: true,
+		},
+		{
+			name:                   "s3 on outposts key with spaces",
+			url:                    "https://ap-123456789012.op-01234567890123456.s3-outposts.us-east-1.amazonaws.com/JULY%2027.zip",
+			service:                "s3-outposts",
+			disableURIPathEscaping: true,
+		},
+		{
+			name:                   "s3 express key with spaces",
+			url:                    "https://bucket--use1-az4--x-s3.s3express-use1-az4.us-east-1.amazonaws.com/JULY%2027.zip",
+			service:                "s3express",
+			disableURIPathEscaping: true,
+		},
+		{
 			name:    "other AWS services retain default escaping",
 			url:     "https://bedrock-runtime.us-east-1.amazonaws.com/model/a%20b/invoke",
 			service: "bedrock",
