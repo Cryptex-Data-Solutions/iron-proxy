@@ -28,13 +28,38 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 	body := strings.Repeat("x", 4096)
 
 	tests := []struct {
-		name          string
-		declared      string // X-Amz-Content-Sha256 sent by the client
-		contentLength int64  // -1 = chunked transfer, as the SDKs send it
-		wantAction    transform.TransformAction
-		wantStatus    int    // for rejections
-		wantPayload   string // signed X-Amz-Content-Sha256 on success
+		name            string
+		unsignedPayload bool   // the unsigned_payload config option
+		declared        string // X-Amz-Content-Sha256 sent by the client
+		contentLength   int64  // -1 = chunked transfer, as the SDKs send it
+		wantAction      transform.TransformAction
+		wantStatus      int    // for rejections
+		wantPayload     string // signed X-Amz-Content-Sha256 on success
 	}{
+		{
+			name:            "unsigned_payload set: trailer mode is still kept",
+			unsignedPayload: true,
+			declared:        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+			contentLength:   -1,
+			wantAction:      transform.ActionContinue,
+			wantPayload:     "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+		},
+		{
+			name:            "unsigned_payload set: per-chunk signed stream is still refused",
+			unsignedPayload: true,
+			declared:        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			contentLength:   int64(len(body)),
+			wantAction:      transform.ActionReject,
+			wantStatus:      http.StatusBadRequest,
+		},
+		{
+			name:            "unsigned_payload set: declared hex hash is signed as UNSIGNED-PAYLOAD",
+			unsignedPayload: true,
+			declared:        sha256Hex([]byte(body)),
+			contentLength:   int64(len(body)),
+			wantAction:      transform.ActionContinue,
+			wantPayload:     "UNSIGNED-PAYLOAD",
+		},
 		{
 			name:          "SDK default: chunked upload with checksum trailer",
 			declared:      "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
@@ -74,7 +99,11 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := buildTransformWith(t, minimalYAML, mapBuilder(srcs))
+			cfg := minimalYAML
+			if tt.unsignedPayload {
+				cfg += "unsigned_payload: true\n"
+			}
+			a := buildTransformWith(t, cfg, mapBuilder(srcs))
 
 			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
 			require.NoError(t, err)
