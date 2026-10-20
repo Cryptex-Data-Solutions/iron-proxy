@@ -50,6 +50,14 @@ func TestCheckInterceptUnchanged(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			name: "different letter case is the same set",
+			next: config.TLS{
+				Intercept:        []string{"GitHub.com", "*.AMAZONAWS.com"},
+				InterceptExclude: []string{"SSM.af-south-1.amazonaws.com"},
+			},
+			wantErr: "",
+		},
+		{
 			name: "host added to intercept",
 			next: config.TLS{
 				Intercept:        []string{"github.com", "*.amazonaws.com", "example.com"},

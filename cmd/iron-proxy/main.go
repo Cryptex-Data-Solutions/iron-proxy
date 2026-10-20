@@ -723,8 +723,9 @@ func newReloadFunc(configPath string, runningTLS config.TLS, holder *transform.P
 // tls.intercept_exclude differs from the running config. Which hosts are
 // decrypted is wired into the listeners at startup, and reload only rebuilds
 // the pipeline, so a changed list would be silently ignored while reload
-// reported success. The lists are compared as sets: order and duplicate
-// entries do not change which hosts are decrypted, so they do not count.
+// reported success. The lists are compared as sets of lowercased hosts:
+// order, duplicate entries and letter case do not change which hosts are
+// decrypted (host matching ignores case), so they do not count.
 func checkInterceptUnchanged(running, next config.TLS) error {
 	lists := []struct {
 		name          string
@@ -734,17 +735,22 @@ func checkInterceptUnchanged(running, next config.TLS) error {
 		{"tls.intercept_exclude", running.InterceptExclude, next.InterceptExclude},
 	}
 	for _, l := range lists {
-		a := slices.Clone(l.running)
-		b := slices.Clone(l.next)
-		slices.Sort(a)
-		slices.Sort(b)
-		a = slices.Compact(a)
-		b = slices.Compact(b)
-		if !slices.Equal(a, b) {
+		if !slices.Equal(interceptHostSet(l.running), interceptHostSet(l.next)) {
 			return fmt.Errorf("%s changed: interception lists are applied at startup only; restart iron-proxy to change them", l.name)
 		}
 	}
 	return nil
+}
+
+// interceptHostSet returns hosts lowercased, sorted and without duplicates,
+// so two lists that intercept the same hosts compare equal.
+func interceptHostSet(hosts []string) []string {
+	set := make([]string, len(hosts))
+	for i, h := range hosts {
+		set[i] = strings.ToLower(h)
+	}
+	slices.Sort(set)
+	return slices.Compact(set)
 }
 
 // buildPipeline creates a transform.Pipeline from config transforms.
