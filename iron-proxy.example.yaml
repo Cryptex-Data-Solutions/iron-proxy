@@ -545,9 +545,12 @@ transforms:
   # STREAMING-UNSIGNED-PAYLOAD-TRAILER (what current AWS SDKs send for
   # checksummed S3 uploads, including multipart parts) is re-signed as is,
   # and the body is streamed without being read, whatever its size. This
-  # applies whatever unsigned_payload is set to. Per-chunk signed streams
-  # (STREAMING-AWS4-HMAC-SHA256-PAYLOAD...) → 400, since each chunk carries
-  # a signature made with the client's key.
+  # applies whatever unsigned_payload is set to. Streams that sign the body as
+  # it goes (STREAMING-AWS4-HMAC-SHA256-PAYLOAD..., -EVENTS) → 400, since
+  # each chunk or event carries a signature made with the client's key.
+  # If an earlier transform already read the body (body_capture, secrets
+  # matching in the body), it may have been cut off at the body limit, so
+  # the checks below apply to it in every mode.
   #
   # Otherwise (no declared mode, or a declared hex hash) the body is hashed:
   # bodies shorter than Content-Length → 413, bodies over the proxy's body

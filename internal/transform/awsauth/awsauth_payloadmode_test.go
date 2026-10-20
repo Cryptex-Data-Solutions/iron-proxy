@@ -13,6 +13,21 @@ import (
 	"github.com/ironsh/iron-proxy/internal/transform/secrets"
 )
 
+const placeholderAuth = "AWS4-HMAC-SHA256 Credential=PLACEHOLDER/20260101/af-south-1/s3/aws4_request, SignedHeaders=host, Signature=abc"
+
+// signedHeaderList returns the SignedHeaders entries of a SigV4
+// Authorization header value.
+func signedHeaderList(t *testing.T, auth string) []string {
+	t.Helper()
+	for _, part := range strings.Split(auth, ",") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(part), "SignedHeaders="); ok {
+			return strings.Split(v, ";")
+		}
+	}
+	t.Fatalf("no SignedHeaders in %q", auth)
+	return nil
+}
+
 // TestTransformRequest_DeclaredPayloadMode covers the payload modes a client
 // can declare in X-Amz-Content-Sha256, signed with the real signer. Current
 // AWS SDKs upload to S3 as aws-chunked bodies with a checksum trailer and no
@@ -23,8 +38,8 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 		"AWS_SECRET_ACCESS_KEY": &staticSource{name: "secret", value: "real-secret"},
 	}
 	// The body limit is far smaller than the body, so any attempt to buffer
-	// it shows up as a 413 body_truncated rejection.
-	const bodyLimit = 16
+	// it shows up as a truncated body.
+	const smallLimit = 16
 	body := strings.Repeat("x", 4096)
 
 	tests := []struct {
@@ -32,34 +47,15 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 		unsignedPayload bool   // the unsigned_payload config option
 		declared        string // X-Amz-Content-Sha256 sent by the client
 		contentLength   int64  // -1 = chunked transfer, as the SDKs send it
-		wantAction      transform.TransformAction
-		wantStatus      int    // for rejections
-		wantPayload     string // signed X-Amz-Content-Sha256 on success
+		// preBuffered simulates an earlier transform (body_capture, secrets
+		// matching in the body) that already read the body, with this body
+		// limit; 0 means the body is still unread.
+		preBuffered int64
+		wantAction  transform.TransformAction
+		wantStatus  int    // for rejections
+		wantPayload string // signed X-Amz-Content-Sha256 on success
 	}{
-		{
-			name:            "unsigned_payload set: trailer mode is still kept",
-			unsignedPayload: true,
-			declared:        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-			contentLength:   -1,
-			wantAction:      transform.ActionContinue,
-			wantPayload:     "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
-		},
-		{
-			name:            "unsigned_payload set: per-chunk signed stream is still refused",
-			unsignedPayload: true,
-			declared:        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-			contentLength:   int64(len(body)),
-			wantAction:      transform.ActionReject,
-			wantStatus:      http.StatusBadRequest,
-		},
-		{
-			name:            "unsigned_payload set: declared hex hash is signed as UNSIGNED-PAYLOAD",
-			unsignedPayload: true,
-			declared:        sha256Hex([]byte(body)),
-			contentLength:   int64(len(body)),
-			wantAction:      transform.ActionContinue,
-			wantPayload:     "UNSIGNED-PAYLOAD",
-		},
+		// Declared modes, body unread: streamed in full whatever its size.
 		{
 			name:          "SDK default: chunked upload with checksum trailer",
 			declared:      "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
@@ -75,6 +71,24 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 			wantPayload:   "UNSIGNED-PAYLOAD",
 		},
 		{
+			name:            "unsigned_payload set: trailer mode is still kept",
+			unsignedPayload: true,
+			declared:        "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+			contentLength:   -1,
+			wantAction:      transform.ActionContinue,
+			wantPayload:     "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+		},
+		{
+			name:            "unsigned_payload set: declared hex hash is signed as UNSIGNED-PAYLOAD",
+			unsignedPayload: true,
+			declared:        sha256Hex([]byte(body)),
+			contentLength:   int64(len(body)),
+			wantAction:      transform.ActionContinue,
+			wantPayload:     "UNSIGNED-PAYLOAD",
+		},
+
+		// Body-signing streams are refused.
+		{
 			name:          "per-chunk signed stream is refused",
 			declared:      "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
 			contentLength: int64(len(body)),
@@ -89,11 +103,62 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 			wantStatus:    http.StatusBadRequest,
 		},
 		{
+			name:          "event-stream signing is refused",
+			declared:      "STREAMING-AWS4-HMAC-SHA256-EVENTS",
+			contentLength: -1,
+			wantAction:    transform.ActionReject,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:            "unsigned_payload set: per-chunk signed stream is still refused",
+			unsignedPayload: true,
+			declared:        "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			contentLength:   int64(len(body)),
+			wantAction:      transform.ActionReject,
+			wantStatus:      http.StatusBadRequest,
+		},
+
+		// A declared hex hash is recalculated, so the body limit applies.
+		{
 			name:          "declared hex hash is still re-hashed, so the body limit applies",
 			declared:      sha256Hex([]byte(body)),
 			contentLength: int64(len(body)),
 			wantAction:    transform.ActionReject,
 			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+
+		// An earlier transform already buffered (and so truncated) the body.
+		{
+			name:          "already buffered and truncated: trailer mode refused",
+			declared:      "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+			contentLength: int64(len(body)),
+			preBuffered:   smallLimit,
+			wantAction:    transform.ActionReject,
+			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:          "already buffered, chunked: truncation undetectable, refused",
+			declared:      "UNSIGNED-PAYLOAD",
+			contentLength: -1,
+			preBuffered:   smallLimit,
+			wantAction:    transform.ActionReject,
+			wantStatus:    http.StatusBadRequest,
+		},
+		{
+			name:            "unsigned_payload set: already buffered and truncated is refused",
+			unsignedPayload: true,
+			contentLength:   int64(len(body)),
+			preBuffered:     smallLimit,
+			wantAction:      transform.ActionReject,
+			wantStatus:      http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:          "already buffered and complete: declared mode kept",
+			declared:      "UNSIGNED-PAYLOAD",
+			contentLength: int64(len(body)),
+			preBuffered:   1 << 20,
+			wantAction:    transform.ActionContinue,
+			wantPayload:   "UNSIGNED-PAYLOAD",
 		},
 	}
 
@@ -105,12 +170,24 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 			}
 			a := buildTransformWith(t, cfg, mapBuilder(srcs))
 
+			limit := int64(smallLimit)
+			if tt.preBuffered > 0 {
+				limit = tt.preBuffered
+			}
 			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
 			require.NoError(t, err)
-			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), bodyLimit)
+			buffered := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), limit)
+			req.Body = buffered
 			req.ContentLength = tt.contentLength
-			req.Header.Set("Authorization", "AWS4-HMAC-SHA256 Credential=PLACEHOLDER/20260101/af-south-1/s3/aws4_request, SignedHeaders=host, Signature=abc")
-			req.Header.Set("X-Amz-Content-Sha256", tt.declared)
+			if tt.preBuffered > 0 {
+				_, err := io.ReadAll(buffered) // an earlier transform reads the body...
+				require.NoError(t, err)
+				buffered.Reset() // ...and rewinds it, as the pipeline does
+			}
+			req.Header.Set("Authorization", placeholderAuth)
+			if tt.declared != "" {
+				req.Header.Set("X-Amz-Content-Sha256", tt.declared)
+			}
 			req.Header.Set("Content-Encoding", "aws-chunked")
 			req.Header.Set("X-Amz-Decoded-Content-Length", "4096")
 			req.Header.Set("X-Amz-Trailer", "x-amz-checksum-crc64nvme")
@@ -121,6 +198,7 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 
 			if tt.wantAction == transform.ActionReject {
 				require.Equal(t, tt.wantStatus, res.Response.StatusCode)
+				require.Equal(t, placeholderAuth, req.Header.Get("Authorization"), "a refused request must not be signed")
 				return
 			}
 
@@ -128,19 +206,47 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 			auth := req.Header.Get("Authorization")
 			require.Contains(t, auth, "Credential=AKIAREALKEY/")
 			require.Equal(t, tt.wantPayload, req.Header.Get("X-Amz-Content-Sha256"))
-			// The aws-chunked headers S3 needs to decode the body are kept
-			// and covered by the new signature.
+
+			// The aws-chunked headers S3 needs to decode the body are kept and
+			// covered by the new signature. Content-Length is signed only when
+			// known, and Transfer-Encoding never is.
+			signed := signedHeaderList(t, auth)
 			require.Equal(t, "aws-chunked", req.Header.Get("Content-Encoding"))
-			for _, h := range []string{"content-encoding", "x-amz-content-sha256", "x-amz-decoded-content-length", "x-amz-trailer"} {
-				require.Contains(t, auth, h, "signed headers should include %s", h)
+			for _, h := range []string{"content-encoding", "host", "x-amz-content-sha256", "x-amz-date", "x-amz-decoded-content-length", "x-amz-trailer"} {
+				require.Contains(t, signed, h)
 			}
-			// The body was never buffered, and the proxy forwards all of it
-			// (StreamingReader is what the proxy sends upstream).
-			buffered := transform.RequireBufferedBody(req.Body)
-			require.Equal(t, -1, buffered.Len(), "body must not be buffered")
+			if tt.contentLength > 0 {
+				require.Contains(t, signed, "content-length")
+			} else {
+				require.NotContains(t, signed, "content-length")
+			}
+			require.NotContains(t, signed, "transfer-encoding")
+
+			// The proxy forwards the whole body (StreamingReader is what it
+			// sends upstream). If nothing read it before, it is still unread.
+			if tt.preBuffered == 0 {
+				require.Equal(t, -1, buffered.Len(), "body must not be buffered")
+			}
 			sent, err := io.ReadAll(buffered.StreamingReader())
 			require.NoError(t, err)
 			require.Equal(t, body, string(sent))
+		})
+	}
+}
+
+func TestTruncateForAudit(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "short value kept", in: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", want: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
+		{name: "exactly 64 kept", in: strings.Repeat("a", 64), want: strings.Repeat("a", 64)},
+		{name: "long value cut", in: strings.Repeat("a", 65), want: strings.Repeat("a", 64) + "...(truncated)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, truncateForAudit(tt.in))
 		})
 	}
 }
