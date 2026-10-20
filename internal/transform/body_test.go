@@ -88,7 +88,13 @@ func TestBufferedBody_Replaced(t *testing.T) {
 	_, err := io.ReadAll(read)
 	require.NoError(t, err)
 	require.False(t, read.Replaced(), "a body that was only read is still the client's")
-	require.True(t, NewBufferedBodyFromBytes([]byte("rewritten")).Replaced())
+
+	rewrapped := NewBufferedBodyFromBytes([]byte("client bytes"))
+	require.False(t, rewrapped.Replaced(), "re-wrapping unchanged bytes is not a replacement")
+
+	rewritten := NewBufferedBodyFromBytes([]byte("rewritten"))
+	rewritten.MarkReplaced()
+	require.True(t, rewritten.Replaced())
 }
 
 func TestBufferedBody_MarkTruncated(t *testing.T) {

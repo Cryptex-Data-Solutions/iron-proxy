@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"sync"
 )
 
@@ -40,10 +41,12 @@ func NewBufferedBody(body io.ReadCloser, maxBytes int64) *BufferedBody {
 }
 
 // NewBufferedBodyFromBytes creates a pre-buffered body from a byte slice.
-// Use this when a transform replaces the body with new content. The body
-// reports Replaced, since it is no longer the client's original bytes.
+// Use this when a transform replaces the body with new content, and call
+// MarkReplaced on it when the bytes differ from what the client sent. To
+// re-read a body without changing it, Reset the existing body instead, which
+// keeps its Truncated state.
 func NewBufferedBodyFromBytes(data []byte) *BufferedBody {
-	b := &BufferedBody{data: data, replaced: true}
+	b := &BufferedBody{data: data}
 	b.once.Do(func() {}) // mark as already buffered
 	return b
 }
@@ -94,12 +97,18 @@ func (b *BufferedBody) Truncated() bool {
 	return b.truncated
 }
 
-// Replaced reports whether a transform replaced the body with new bytes
-// (NewBufferedBodyFromBytes), so it may differ from what the client sent.
-// Formats whose framing or checksum covers the body (aws-chunked uploads with
-// a checksum trailer) cannot survive that.
+// Replaced reports whether a transform changed the body's bytes (it called
+// MarkReplaced). Formats whose framing or checksum covers the body
+// (aws-chunked uploads with a checksum trailer) cannot survive that.
 func (b *BufferedBody) Replaced() bool {
 	return b.replaced
+}
+
+// MarkReplaced flags a body whose bytes a transform changed. Transforms that
+// rewrite a body (secrets, credential_mask, grpc) call it on the replacement.
+// Re-wrapping the client's unchanged bytes must not call it.
+func (b *BufferedBody) MarkReplaced() {
+	b.replaced = true
 }
 
 // MarkTruncated flags a body as truncated. A transform that replaces a
@@ -151,6 +160,19 @@ func (b *BufferedBody) Close() error {
 		return err
 	}
 	return nil
+}
+
+// RewindRequestBody makes req.Body readable from the start again after a
+// transform read it without changing it (to hash or sign it). It rewinds the
+// existing BufferedBody, which keeps its Truncated and Replaced state, rather
+// than re-wrapping data, which would lose them. data is used only when the body
+// is not a BufferedBody.
+func RewindRequestBody(req *http.Request, data []byte) {
+	if b, ok := req.Body.(*BufferedBody); ok {
+		b.Reset()
+		return
+	}
+	req.Body = NewBufferedBodyFromBytes(data)
 }
 
 // RequireBufferedBody asserts that body is a *BufferedBody and returns it.

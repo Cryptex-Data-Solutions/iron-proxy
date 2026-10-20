@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/transform"
+	_ "github.com/ironsh/iron-proxy/internal/transform/hmacsign" // registers hmac_sign
 )
 
 // The "secrets" transform is registered because awsauth.go imports its
@@ -233,4 +234,62 @@ secrets:
 			require.Contains(t, string(body), "chunked_upload_body_rewritten")
 		})
 	}
+}
+
+// hmac_sign (with allow_chunked_body) reads the body to sign it but leaves its
+// bytes unchanged. A trailer-mode upload that passes through it first must
+// still be signed by aws_auth: reading is not rewriting.
+func TestDeclaredPayload_PipelineTrailerModeAfterHMACSignRead(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("HMAC_KEY", "key-id")
+	t.Setenv("HMAC_SECRET", "c2VjcmV0") // base64 "secret"
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	hmacTr := build("hmac_sign", `
+timestamp:
+  format: unix_seconds
+signature:
+  algorithm: sha256
+  key_encoding: base64
+  output_encoding: base64
+  message: "{{.Timestamp}}{{.Body}}"
+credentials:
+  key:    {type: env, var: HMAC_KEY}
+  secret: {type: env, var: HMAC_SECRET}
+headers:
+  - name: "X-Test-Sign"
+    value: "{{.Signature}}"
+allow_chunked_body: true
+rules:
+  - host: "*.s3.af-south-1.amazonaws.com"
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{hmacTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	body := "5\r\nhello\r\n0\r\nx-amz-checksum-crc64nvme:abc=\r\n\r\n"
+	req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+	req.ContentLength = -1
+	req.Header.Set("Authorization", placeholderAuth)
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+
+	var traces []transform.TransformTrace
+	rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+	require.NoError(t, err)
+	require.Nil(t, rejected, "hmac_sign only read the body, so the upload is still the client's")
+	require.NotEmpty(t, req.Header.Get("X-Test-Sign"), "hmac_sign ran")
+	require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+	sent, err := io.ReadAll(transform.RequireBufferedBody(req.Body).StreamingReader())
+	require.NoError(t, err)
+	require.Equal(t, body, string(sent))
 }

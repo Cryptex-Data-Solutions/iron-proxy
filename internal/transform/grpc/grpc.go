@@ -342,6 +342,7 @@ func applyModifiedRequest(pb *transformv1.HttpRequest, req *http.Request) {
 	}
 	if pb.GetBody() != nil {
 		newBody := transform.NewBufferedBodyFromBytes(pb.GetBody())
+		newBody.MarkReplaced() // the plugin may have changed any byte
 		if original, ok := req.Body.(*transform.BufferedBody); ok && original.Truncated() {
 			// The plugin saw a body cut off at the proxy's limit; whatever it
 			// returns is built from that, so keep the request marked.

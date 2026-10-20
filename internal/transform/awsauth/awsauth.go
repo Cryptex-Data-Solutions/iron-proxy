@@ -608,7 +608,7 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 		)
 	}
 
-	req.Body = transform.NewBufferedBodyFromBytes(body)
+	transform.RewindRequestBody(req, body)
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:]), nil
 }

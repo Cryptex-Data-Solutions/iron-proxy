@@ -270,7 +270,7 @@ func (h *HMACSign) TransformRequest(ctx context.Context, tctx *transform.Transfo
 		injected = append(injected, "header:"+hdr.name)
 	}
 
-	req.Body = transform.NewBufferedBodyFromBytes(body)
+	transform.RewindRequestBody(req, body)
 	tctx.Annotate("injected", injected)
 	if len(injected) > 0 {
 		tctx.MarkCredentialInjected(h.Name())

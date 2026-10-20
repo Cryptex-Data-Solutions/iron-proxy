@@ -588,6 +588,7 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 	original, _ := req.Body.(*transform.BufferedBody)
 	truncated := original != nil && original.Truncated()
 	newBody := transform.NewBufferedBodyFromBytes(replaced)
+	newBody.MarkReplaced()
 	if truncated {
 		// The original was cut off at the proxy's body limit. Carry that over,
 		// so a later transform (aws_auth, hmac_sign) can still refuse it: the

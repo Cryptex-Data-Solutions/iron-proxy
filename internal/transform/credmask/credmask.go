@@ -554,7 +554,9 @@ func (m *CredMask) swapOAuthRefresh(tctx *transform.TransformContext, req *http.
 			slog.String("kind", p.kind), slog.String("error", err.Error()))
 		return nil
 	}
-	req.Body = transform.NewBufferedBodyFromBytes(out)
+	replacement := transform.NewBufferedBodyFromBytes(out)
+	replacement.MarkReplaced()
+	req.Body = replacement
 	req.ContentLength = int64(len(out))
 	req.Header.Set("Content-Length", strconv.Itoa(len(out)))
 	tctx.Annotate("swapped", p.kind)
@@ -641,7 +643,9 @@ func (m *CredMask) swapGitHubRefresh(tctx *transform.TransformContext, req *http
 			return nil
 		}
 		if bodySwapped {
-			req.Body = transform.NewBufferedBodyFromBytes(out)
+			replacement := transform.NewBufferedBodyFromBytes(out)
+			replacement.MarkReplaced()
+			req.Body = replacement
 			req.ContentLength = int64(len(out))
 			req.Header.Set("Content-Length", strconv.Itoa(len(out)))
 			swapped = true
