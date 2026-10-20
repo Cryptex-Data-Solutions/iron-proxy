@@ -2,7 +2,9 @@ package awsauth
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -234,19 +236,78 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 	}
 }
 
-func TestTruncateForAudit(t *testing.T) {
+// TestRefusedStreamingMode_AuditLabel checks what the audit log records for a
+// refused STREAMING-* value, through a real pipeline where an earlier
+// secrets transform (matching every header, its default) swaps a real secret
+// into the client's X-Amz-Content-Sha256. The header value must never reach
+// the audit log: only a known mode's name, or a fixed label.
+func TestRefusedStreamingMode_AuditLabel(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("API_TOKEN", "real-api-token-value")
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	secretsTr := build("secrets", `
+secrets:
+  - source: {type: env, var: API_TOKEN}
+    rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
+    replace:
+      proxy_value: "proxy-api-token"
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
 	tests := []struct {
-		name string
-		in   string
-		want string
+		name      string
+		declared  string
+		wantLabel string
 	}{
-		{name: "short value kept", in: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD", want: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"},
-		{name: "exactly 64 kept", in: strings.Repeat("a", 64), want: strings.Repeat("a", 64)},
-		{name: "long value cut", in: strings.Repeat("a", 65), want: strings.Repeat("a", 64) + "...(truncated)"},
+		{
+			name:      "known mode is named",
+			declared:  "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			wantLabel: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+		},
+		{
+			name:      "client value with a swapped-in secret is not logged",
+			declared:  "STREAMING-proxy-api-token",
+			wantLabel: "unrecognised_streaming_mode",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require.Equal(t, tt.want, truncateForAudit(tt.in))
+			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+			require.NoError(t, err)
+			req.Body = transform.NewBufferedBody(http.NoBody, 1<<20)
+			req.Header.Set("Authorization", placeholderAuth)
+			req.Header.Set("X-Amz-Content-Sha256", tt.declared)
+
+			var traces []transform.TransformTrace
+			rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+			require.NoError(t, err)
+			require.NotNil(t, rejected)
+			require.Equal(t, http.StatusBadRequest, rejected.StatusCode)
+			if strings.Contains(tt.declared, "proxy-api-token") {
+				// Prove the scenario is real: secrets did swap the secret in.
+				require.Equal(t, "STREAMING-real-api-token-value", req.Header.Get("X-Amz-Content-Sha256"))
+			}
+
+			var label any
+			for _, tr := range traces {
+				for k, v := range tr.Annotations {
+					require.NotContains(t, fmt.Sprint(v), "real-api-token-value", "annotation %q leaks the secret", k)
+				}
+				if tr.Name == "aws_auth" {
+					label = tr.Annotations["payload"]
+				}
+			}
+			require.Equal(t, tt.wantLabel, label)
 		})
 	}
 }

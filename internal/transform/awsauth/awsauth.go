@@ -523,7 +523,7 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 		// signature and made with the client's key, so re-signing only the
 		// headers can never produce a request upstream accepts.
 		tctx.Annotate("rejected", "signed_streaming_payload_not_supported")
-		tctx.Annotate("payload", truncateForAudit(declared))
+		tctx.Annotate("payload", streamingModeLabel(declared))
 		return "", &transform.TransformResult{
 			Action:   transform.ActionReject,
 			Response: errorResponse(req, http.StatusBadRequest, "signed_streaming_payload_not_supported"),
@@ -631,14 +631,26 @@ func (a *AWSAuth) checkAlreadyBufferedBody(tctx *transform.TransformContext, req
 	return nil
 }
 
-// truncateForAudit caps a client-supplied value before it is written to the
-// audit log, so a long header value cannot bloat the record.
-func truncateForAudit(s string) string {
-	const max = 64
-	if len(s) <= max {
-		return s
+// knownStreamingModes are the body-signing STREAMING-* payload modes AWS
+// defines. They are refused, and named in the audit log.
+var knownStreamingModes = map[string]bool{
+	"STREAMING-AWS4-HMAC-SHA256-PAYLOAD":               true,
+	"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER":       true,
+	"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD":         true,
+	"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER": true,
+	"STREAMING-AWS4-HMAC-SHA256-EVENTS":                true,
+}
+
+// streamingModeLabel returns what the audit log records for a refused
+// STREAMING-* value: the mode's name if it is one AWS defines, otherwise a
+// fixed label. The header value itself is never logged: it is client
+// controlled, and an earlier transform (secrets matching all headers) may
+// have swapped a real secret into it.
+func streamingModeLabel(declared string) string {
+	if knownStreamingModes[declared] {
+		return declared
 	}
-	return s[:max] + "...(truncated)"
+	return "unrecognised_streaming_mode"
 }
 
 func errorResponse(req *http.Request, status int, reason string) *http.Response {
