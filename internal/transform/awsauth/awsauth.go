@@ -112,6 +112,17 @@ type sourceBuilder func(yaml.Node, *slog.Logger) (secrets.Source, error)
 // reaching for the real signer.
 type signFunc func(ctx context.Context, creds aws.Credentials, req *http.Request, payloadHash, service, region string, signingTime time.Time) error
 
+// s3SigningNames are the SigV4 signing names that sign the request path as
+// sent instead of escaping it a second time. They match the names for which
+// the SDK's S3 endpoint rules set DisableDoubleEncoding (service/s3/endpoints.go):
+// S3 itself, S3 Object Lambda, S3 on Outposts and S3 Express One Zone.
+var s3SigningNames = map[string]struct{}{
+	"s3":               {},
+	"s3-object-lambda": {},
+	"s3-outposts":      {},
+	"s3express":        {},
+}
+
 // Credential provider kinds, annotated on credential-unavailable rejections.
 const (
 	providerStatic           = "static"
@@ -208,7 +219,10 @@ func newFromConfig(c config, logger *slog.Logger, build sourceBuilder, buildCred
 
 		now: time.Now,
 		sign: func(ctx context.Context, creds aws.Credentials, req *http.Request, payloadHash, service, region string, signingTime time.Time) error {
-			return signer.SignHTTP(ctx, creds, req, payloadHash, service, region, signingTime)
+			return signer.SignHTTP(ctx, creds, req, payloadHash, service, region, signingTime, func(o *v4.SignerOptions) {
+				_, isS3 := s3SigningNames[service]
+				o.DisableURIPathEscaping = isS3
+			})
 		},
 	}, nil
 }
