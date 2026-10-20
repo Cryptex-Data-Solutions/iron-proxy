@@ -897,6 +897,11 @@ func (p *Proxy) streamSSE(w http.ResponseWriter, resp *http.Response) {
 		}
 		return
 	}
+	// Send the headers now. net/http holds them until the first write or
+	// flush, so a stream that stays silent (an MCP server-to-client GET
+	// stream before its first event) would otherwise never show the client
+	// a response.
+	flusher.Flush()
 
 	buf := make([]byte, 32*1024)
 	for {

@@ -649,6 +649,87 @@ func TestHTTPProxy_SSEStreaming(t *testing.T) {
 	require.Contains(t, string(body), "data: event3")
 }
 
+// TestHTTPProxy_SSEOpenStream checks that an SSE response reaches the client
+// while the upstream stream is still open: the headers as soon as upstream
+// sends them (even if no event follows for a long time), and each event as
+// soon as it is sent. MCP's server-to-client GET stream is typically silent
+// until the server has something to say.
+func TestHTTPProxy_SSEOpenStream(t *testing.T) {
+	tests := []struct {
+		name       string
+		firstEvent string // sent right after the headers; "" means stay silent
+	}{
+		{name: "headers arrive on a silent stream", firstEvent: ""},
+		{name: "event arrives before the stream ends", firstEvent: "data: hello\n\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			release := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				flusher := w.(http.Flusher)
+				if tt.firstEvent != "" {
+					_, _ = fmt.Fprint(w, tt.firstEvent)
+				}
+				flusher.Flush()
+				// Keep the stream open until the test ends.
+				select {
+				case <-release:
+				case <-r.Context().Done():
+				}
+			}))
+			defer upstream.Close()
+			defer close(release)
+
+			_, httpAddr, _, _ := startProxy(t)
+
+			req, err := http.NewRequest("GET", fmt.Sprintf("http://%s/events", httpAddr), nil)
+			require.NoError(t, err)
+			req.Host = upstream.Listener.Addr().String()
+
+			type result struct {
+				resp *http.Response
+				err  error
+			}
+			done := make(chan result, 1)
+			go func() {
+				resp, err := http.DefaultClient.Do(req)
+				done <- result{resp, err}
+			}()
+
+			var resp *http.Response
+			select {
+			case res := <-done:
+				require.NoError(t, res.err)
+				resp = res.resp
+			case <-time.After(2 * time.Second):
+				t.Fatal("no response headers while the upstream stream is open")
+			}
+			defer resp.Body.Close()
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			require.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+
+			if tt.firstEvent == "" {
+				return
+			}
+			got := make(chan string, 1)
+			go func() {
+				buf := make([]byte, len(tt.firstEvent))
+				n, _ := io.ReadFull(resp.Body, buf)
+				got <- string(buf[:n])
+			}()
+			select {
+			case s := <-got:
+				require.Equal(t, tt.firstEvent, s)
+			case <-time.After(2 * time.Second):
+				t.Fatal("event not delivered while the upstream stream is open")
+			}
+		})
+	}
+}
+
 func TestHTTPProxy_RequestContentLengthPreserved(t *testing.T) {
 	const requestBody = "fixed-size request body"
 	var gotContentLength int64
