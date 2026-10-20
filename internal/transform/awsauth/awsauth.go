@@ -506,13 +506,22 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 	// UNSIGNED-PAYLOAD is just as invalid for an aws-chunked body. A declared
 	// hex hash still takes the paths below: an earlier transform may have
 	// rewritten the body, and the hash must match what is actually sent.
+	//
+	// The audit annotations below are fixed labels of our own, never the
+	// header value or the AWS mode name: the value is client controlled, and
+	// an earlier transform (secrets matching every header, its default) may
+	// have swapped a real secret into it, even one that equals a mode name.
 	declared := req.Header.Get("X-Amz-Content-Sha256")
 	switch {
 	case declared == streamingUnsignedPayloadTrailer || declared == unsignedPayload:
 		if reject := a.checkAlreadyBufferedBody(tctx, req); reject != nil {
 			return "", reject
 		}
-		tctx.Annotate("payload", declared)
+		if declared == streamingUnsignedPayloadTrailer {
+			tctx.Annotate("payload", "client_declared_unsigned_trailer")
+		} else {
+			tctx.Annotate("payload", "client_declared_unsigned")
+		}
 		return declared, nil
 	case strings.HasPrefix(declared, "STREAMING-"):
 		// The other STREAMING-* modes sign the body as it streams:
@@ -523,7 +532,7 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 		// signature and made with the client's key, so re-signing only the
 		// headers can never produce a request upstream accepts.
 		tctx.Annotate("rejected", "signed_streaming_payload_not_supported")
-		tctx.Annotate("payload", streamingModeLabel(declared))
+		tctx.Annotate("payload", "client_declared_signed_streaming")
 		return "", &transform.TransformResult{
 			Action:   transform.ActionReject,
 			Response: errorResponse(req, http.StatusBadRequest, "signed_streaming_payload_not_supported"),
@@ -629,28 +638,6 @@ func (a *AWSAuth) checkAlreadyBufferedBody(tctx *transform.TransformContext, req
 		}
 	}
 	return nil
-}
-
-// knownStreamingModes are the body-signing STREAMING-* payload modes AWS
-// defines. They are refused, and named in the audit log.
-var knownStreamingModes = map[string]bool{
-	"STREAMING-AWS4-HMAC-SHA256-PAYLOAD":               true,
-	"STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER":       true,
-	"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD":         true,
-	"STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD-TRAILER": true,
-	"STREAMING-AWS4-HMAC-SHA256-EVENTS":                true,
-}
-
-// streamingModeLabel returns what the audit log records for a refused
-// STREAMING-* value: the mode's name if it is one AWS defines, otherwise a
-// fixed label. The header value itself is never logged: it is client
-// controlled, and an earlier transform (secrets matching all headers) may
-// have swapped a real secret into it.
-func streamingModeLabel(declared string) string {
-	if knownStreamingModes[declared] {
-		return declared
-	}
-	return "unrecognised_streaming_mode"
 }
 
 func errorResponse(req *http.Request, status int, reason string) *http.Response {

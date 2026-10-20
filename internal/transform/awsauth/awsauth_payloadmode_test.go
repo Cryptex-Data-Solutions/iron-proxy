@@ -236,15 +236,15 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 	}
 }
 
-// TestRefusedStreamingMode_AuditLabel checks what the audit log records for a
-// refused STREAMING-* value, through a real pipeline where an earlier
-// secrets transform (matching every header, its default) swaps a real secret
-// into the client's X-Amz-Content-Sha256. The header value must never reach
-// the audit log: only a known mode's name, or a fixed label.
-func TestRefusedStreamingMode_AuditLabel(t *testing.T) {
+// TestDeclaredPayload_AuditLabel checks what the audit log records for the
+// client's declared payload mode, through a real pipeline where an earlier
+// secrets transform (matching every header, its default) may have swapped a
+// real secret into X-Amz-Content-Sha256. Only fixed labels of our own are
+// logged, never the header value: not even when the secret equals an AWS
+// mode name.
+func TestDeclaredPayload_AuditLabel(t *testing.T) {
 	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
 	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
-	t.Setenv("API_TOKEN", "real-api-token-value")
 
 	build := func(name, cfg string) transform.Transformer {
 		t.Helper()
@@ -254,34 +254,61 @@ func TestRefusedStreamingMode_AuditLabel(t *testing.T) {
 		require.NoError(t, err)
 		return tr
 	}
-	secretsTr := build("secrets", `
+
+	tests := []struct {
+		name         string
+		secret       string // the real value secrets swaps in for "proxy-api-token"
+		declared     string // X-Amz-Content-Sha256 as the client sends it
+		wantSwapped  string // the header after the swap, to prove the scenario
+		wantRejected bool
+		wantLabel    string
+	}{
+		{
+			name:         "plain refused mode, nothing swapped",
+			secret:       "real-api-token-value",
+			declared:     "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			wantSwapped:  "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			wantRejected: true,
+			wantLabel:    "client_declared_signed_streaming",
+		},
+		{
+			name:         "secret swapped into a refused value",
+			secret:       "real-api-token-value",
+			declared:     "STREAMING-proxy-api-token",
+			wantSwapped:  "STREAMING-real-api-token-value",
+			wantRejected: true,
+			wantLabel:    "client_declared_signed_streaming",
+		},
+		{
+			name:         "secret that equals a refused mode name",
+			secret:       "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			declared:     "proxy-api-token",
+			wantSwapped:  "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+			wantRejected: true,
+			wantLabel:    "client_declared_signed_streaming",
+		},
+		{
+			name:         "secret that equals an accepted mode name",
+			secret:       "UNSIGNED-PAYLOAD",
+			declared:     "proxy-api-token",
+			wantSwapped:  "UNSIGNED-PAYLOAD",
+			wantRejected: false,
+			wantLabel:    "client_declared_unsigned",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("API_TOKEN", tt.secret)
+			secretsTr := build("secrets", `
 secrets:
   - source: {type: env, var: API_TOKEN}
     rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
     replace:
       proxy_value: "proxy-api-token"
 `)
-	awsTr := build("aws_auth", minimalYAML)
-	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+			awsTr := build("aws_auth", minimalYAML)
+			pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
 
-	tests := []struct {
-		name      string
-		declared  string
-		wantLabel string
-	}{
-		{
-			name:      "known mode is named",
-			declared:  "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-			wantLabel: "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
-		},
-		{
-			name:      "client value with a swapped-in secret is not logged",
-			declared:  "STREAMING-proxy-api-token",
-			wantLabel: "unrecognised_streaming_mode",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
 			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
 			require.NoError(t, err)
 			req.Body = transform.NewBufferedBody(http.NoBody, 1<<20)
@@ -291,17 +318,21 @@ secrets:
 			var traces []transform.TransformTrace
 			rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
 			require.NoError(t, err)
-			require.NotNil(t, rejected)
-			require.Equal(t, http.StatusBadRequest, rejected.StatusCode)
-			if strings.Contains(tt.declared, "proxy-api-token") {
-				// Prove the scenario is real: secrets did swap the secret in.
-				require.Equal(t, "STREAMING-real-api-token-value", req.Header.Get("X-Amz-Content-Sha256"))
+			if tt.wantRejected {
+				require.NotNil(t, rejected)
+				require.Equal(t, http.StatusBadRequest, rejected.StatusCode)
+				// Refused before signing, so the swapped header is still there.
+				require.Equal(t, tt.wantSwapped, req.Header.Get("X-Amz-Content-Sha256"))
+			} else {
+				require.Nil(t, rejected)
+				// Signed with the declared mode the swap produced.
+				require.Equal(t, tt.wantSwapped, req.Header.Get("X-Amz-Content-Sha256"))
 			}
 
 			var label any
 			for _, tr := range traces {
 				for k, v := range tr.Annotations {
-					require.NotContains(t, fmt.Sprint(v), "real-api-token-value", "annotation %q leaks the secret", k)
+					require.NotContains(t, fmt.Sprint(v), tt.secret, "annotation %q leaks the secret", k)
 				}
 				if tr.Name == "aws_auth" {
 					label = tr.Annotations["payload"]
