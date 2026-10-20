@@ -723,7 +723,8 @@ func newReloadFunc(configPath string, runningTLS config.TLS, holder *transform.P
 // tls.intercept_exclude differs from the running config. Which hosts are
 // decrypted is wired into the listeners at startup, and reload only rebuilds
 // the pipeline, so a changed list would be silently ignored while reload
-// reported success. Order does not matter: the lists are compared as sets.
+// reported success. The lists are compared as sets: order and duplicate
+// entries do not change which hosts are decrypted, so they do not count.
 func checkInterceptUnchanged(running, next config.TLS) error {
 	lists := []struct {
 		name          string
@@ -737,6 +738,8 @@ func checkInterceptUnchanged(running, next config.TLS) error {
 		b := slices.Clone(l.next)
 		slices.Sort(a)
 		slices.Sort(b)
+		a = slices.Compact(a)
+		b = slices.Compact(b)
 		if !slices.Equal(a, b) {
 			return fmt.Errorf("%s changed: interception lists are applied at startup only; restart iron-proxy to change them", l.name)
 		}

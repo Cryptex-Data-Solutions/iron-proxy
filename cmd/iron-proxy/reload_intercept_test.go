@@ -42,6 +42,14 @@ func TestCheckInterceptUnchanged(t *testing.T) {
 			wantErr: "",
 		},
 		{
+			name: "duplicate entries are the same set",
+			next: config.TLS{
+				Intercept:        []string{"github.com", "*.amazonaws.com", "github.com"},
+				InterceptExclude: []string{"ssm.af-south-1.amazonaws.com", "ssm.af-south-1.amazonaws.com"},
+			},
+			wantErr: "",
+		},
+		{
 			name: "host added to intercept",
 			next: config.TLS{
 				Intercept:        []string{"github.com", "*.amazonaws.com", "example.com"},
