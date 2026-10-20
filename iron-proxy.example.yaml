@@ -91,7 +91,8 @@ tls:
   # is tunnelled as in sni-only mode: the allowlist still applies to its SNI,
   # but nothing is decrypted. intercept_exclude removes hosts even when
   # intercept (or the default of "everything") covers them. Leave both unset
-  # to decrypt every host.
+  # to decrypt every host. Both are read at startup: changing them needs a
+  # restart, and /v1/reload refuses a config that changes them.
   # intercept:
   #   - "github.com"
   #   - "*.amazonaws.com"
