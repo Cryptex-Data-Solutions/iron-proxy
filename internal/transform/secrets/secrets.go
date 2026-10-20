@@ -586,5 +586,14 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 
 	replaced := bytes.ReplaceAll(data, []byte(sec.proxyValue), []byte(realValue))
 	req.Body = transform.NewBufferedBodyFromBytes(replaced)
+	// Keep ContentLength in step with the new body, as credential_mask and
+	// grpc do, so a later transform that compares the body with its declared
+	// length (aws_auth, hmac_sign) does not take a shorter real value for a
+	// truncated body. Only when the original was read in full: a body cut off
+	// at the proxy's limit keeps its original length, so the truncation stays
+	// detectable.
+	if req.ContentLength >= 0 && int64(len(data)) == req.ContentLength {
+		req.ContentLength = int64(len(replaced))
+	}
 	return "body"
 }

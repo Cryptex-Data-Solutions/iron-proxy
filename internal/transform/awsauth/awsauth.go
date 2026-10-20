@@ -30,7 +30,11 @@
 //     check.
 //
 // A body an earlier transform already buffered may have been cut off at the
-// proxy's body limit, so it gets the same length checks in every case.
+// proxy's body limit, so it gets the same length checks in every case. A
+// transform placed after aws_auth cannot be checked here: if it reads or
+// rewrites the body, the request no longer matches its signature (or, for an
+// unread body, is cut off after signing). Place aws_auth after every
+// transform that reads or rewrites request bodies.
 //
 // Setting placeholder_access_key_id (Cryptex addition) replaces "re-sign
 // every SigV4 request, reject everything else" with a write policy: only

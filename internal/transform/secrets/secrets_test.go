@@ -206,6 +206,66 @@ func TestSecrets_BodySwap(t *testing.T) {
 	require.Contains(t, string(result), `"model": "gpt-4"`)
 }
 
+// TestSecrets_BodySwapContentLength checks that a body swap keeps
+// ContentLength in step with the rewritten body, except when the body was cut
+// off at the buffer limit, where the original length is kept so later
+// transforms can still detect the truncation.
+func TestSecrets_BodySwapContentLength(t *testing.T) {
+	// The placeholder is one byte longer than the real value.
+	const placeholder = "proxy-openai-abc123"
+	const real = "sk-real-openai-key"
+	complete := `{"api_key": "` + placeholder + `"}`
+	long := complete + strings.Repeat(" ", 64)
+
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		bufferLimit   int64
+		wantLength    int64
+	}{
+		{
+			name:          "complete body: length follows the shorter replacement",
+			body:          complete,
+			contentLength: int64(len(complete)),
+			bufferLimit:   1 << 20,
+			wantLength:    int64(len(complete) - len(placeholder) + len(real)),
+		},
+		{
+			name:          "chunked body: length stays unknown",
+			body:          complete,
+			contentLength: -1,
+			bufferLimit:   1 << 20,
+			wantLength:    -1,
+		},
+		{
+			name:          "truncated body: original length kept so truncation stays visible",
+			body:          long,
+			contentLength: int64(len(long)),
+			bufferLimit:   int64(len(complete)), // cuts off the trailing spaces
+			wantLength:    int64(len(long)),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := makeSecrets(t, []secretEntry{defaultEntry(func(e *secretEntry) {
+				e.MatchHeaders = nil
+				e.MatchBody = true
+			})})
+			req := openaiReq("POST", "/v1/chat")
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(tt.body)), tt.bufferLimit)
+			req.ContentLength = tt.contentLength
+
+			doTransform(t, s, req)
+
+			require.Equal(t, tt.wantLength, req.ContentLength)
+			got, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			require.Contains(t, string(got), real)
+		})
+	}
+}
+
 func TestSecrets_HostMatch(t *testing.T) {
 	s := makeSecrets(t, []secretEntry{defaultEntry()})
 

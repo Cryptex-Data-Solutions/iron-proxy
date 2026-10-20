@@ -550,7 +550,9 @@ transforms:
   # each chunk or event carries a signature made with the client's key.
   # If an earlier transform already read the body (body_capture, secrets
   # matching in the body), it may have been cut off at the body limit, so
-  # the checks below apply to it in every mode.
+  # the checks below apply to it in every mode. Place aws_auth after every
+  # transform that reads or rewrites request bodies: one that runs after it
+  # changes or cuts off a body that is already signed.
   #
   # Otherwise (no declared mode, or a declared hex hash) the body is hashed:
   # bodies shorter than Content-Length → 413, bodies over the proxy's body
