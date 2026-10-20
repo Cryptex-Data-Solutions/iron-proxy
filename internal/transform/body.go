@@ -27,6 +27,7 @@ type BufferedBody struct {
 	pos       int
 	maxBytes  int64
 	truncated bool
+	replaced  bool
 }
 
 // NewBufferedBody wraps an io.ReadCloser for lazy buffering. maxBytes caps
@@ -39,9 +40,10 @@ func NewBufferedBody(body io.ReadCloser, maxBytes int64) *BufferedBody {
 }
 
 // NewBufferedBodyFromBytes creates a pre-buffered body from a byte slice.
-// Use this when a transform replaces the body with new content.
+// Use this when a transform replaces the body with new content. The body
+// reports Replaced, since it is no longer the client's original bytes.
 func NewBufferedBodyFromBytes(data []byte) *BufferedBody {
-	b := &BufferedBody{data: data}
+	b := &BufferedBody{data: data, replaced: true}
 	b.once.Do(func() {}) // mark as already buffered
 	return b
 }
@@ -90,6 +92,14 @@ func (b *BufferedBody) buffer() error {
 // that fitted.
 func (b *BufferedBody) Truncated() bool {
 	return b.truncated
+}
+
+// Replaced reports whether a transform replaced the body with new bytes
+// (NewBufferedBodyFromBytes), so it may differ from what the client sent.
+// Formats whose framing or checksum covers the body (aws-chunked uploads with
+// a checksum trailer) cannot survive that.
+func (b *BufferedBody) Replaced() bool {
+	return b.replaced
 }
 
 // MarkTruncated flags a body as truncated. A transform that replaces a

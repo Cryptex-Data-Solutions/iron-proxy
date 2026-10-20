@@ -83,6 +83,14 @@ func TestBufferedBody_Truncated(t *testing.T) {
 	}
 }
 
+func TestBufferedBody_Replaced(t *testing.T) {
+	read := NewBufferedBody(io.NopCloser(strings.NewReader("client bytes")), 1024)
+	_, err := io.ReadAll(read)
+	require.NoError(t, err)
+	require.False(t, read.Replaced(), "a body that was only read is still the client's")
+	require.True(t, NewBufferedBodyFromBytes([]byte("rewritten")).Replaced())
+}
+
 func TestBufferedBody_MarkTruncated(t *testing.T) {
 	// A rewrite of a truncated body keeps the flag, even if it is longer.
 	replacement := NewBufferedBodyFromBytes([]byte("a longer rewritten body"))

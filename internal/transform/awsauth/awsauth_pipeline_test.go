@@ -171,3 +171,66 @@ secrets:
 	require.NotNil(t, rejected, "a truncated body must not be signed, however long the rewrite")
 	require.Equal(t, http.StatusRequestEntityTooLarge, rejected.StatusCode)
 }
+
+// An aws-chunked upload with a checksum trailer carries chunk sizes and a
+// checksum of its payload, so a secrets body swap inside it makes the upload
+// malformed. aws_auth refuses it with a clear reason; a body secrets only
+// read (no placeholder in it) is still the client's and is signed.
+func TestDeclaredPayload_PipelineTrailerModeAfterSecretsBodySwap(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("UPLOAD_TOKEN", "real-upload-token")
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	secretsTr := build("secrets", `
+secrets:
+  - source: {type: env, var: UPLOAD_TOKEN}
+    rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
+    replace:
+      proxy_value: "proxy-upload-token"
+      match_body: true
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	tests := []struct {
+		name         string
+		body         string
+		wantRejected bool
+	}{
+		{name: "placeholder in the body: swapped, so refused", body: "11\r\nproxy-upload-token\r\n0\r\nx-amz-checksum-crc64nvme:abc=\r\n\r\n", wantRejected: true},
+		{name: "no placeholder: only read, so signed", body: "5\r\nhello\r\n0\r\nx-amz-checksum-crc64nvme:abc=\r\n\r\n", wantRejected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+			require.NoError(t, err)
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(tt.body)), 1<<20)
+			req.ContentLength = -1
+			req.Header.Set("Authorization", placeholderAuth)
+			req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+			req.Header.Set("Content-Encoding", "aws-chunked")
+
+			var traces []transform.TransformTrace
+			rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+			require.NoError(t, err)
+			if !tt.wantRejected {
+				require.Nil(t, rejected)
+				require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+				return
+			}
+			require.NotNil(t, rejected)
+			require.Equal(t, http.StatusBadRequest, rejected.StatusCode)
+			body, err := io.ReadAll(rejected.Body)
+			require.NoError(t, err)
+			require.Contains(t, string(body), "chunked_upload_body_rewritten")
+		})
+	}
+}

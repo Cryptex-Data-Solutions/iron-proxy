@@ -518,6 +518,18 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 			return "", reject
 		}
 		if declared == streamingUnsignedPayloadTrailer {
+			// The aws-chunked body carries the client's chunk sizes and a
+			// checksum of the payload in its trailer. If an earlier transform
+			// rewrote it (secrets matching in the body), both are now wrong
+			// and S3 would reject the upload as malformed or failing its
+			// checksum. Refuse it here with a clear reason instead.
+			if buffered, ok := req.Body.(*transform.BufferedBody); ok && buffered.Replaced() {
+				tctx.Annotate("rejected", "chunked_upload_body_rewritten")
+				return "", &transform.TransformResult{
+					Action:   transform.ActionReject,
+					Response: errorResponse(req, http.StatusBadRequest, "chunked_upload_body_rewritten"),
+				}
+			}
 			tctx.Annotate("payload", "client_declared_unsigned_trailer")
 		} else {
 			tctx.Annotate("payload", "client_declared_unsigned")
