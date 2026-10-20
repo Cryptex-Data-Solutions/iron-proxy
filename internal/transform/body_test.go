@@ -55,6 +55,56 @@ func TestBufferedBody_MaxBytesTruncates(t *testing.T) {
 	require.Equal(t, "hello", string(data))
 }
 
+func TestBufferedBody_Truncated(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		maxBytes int64
+		read     bool
+		wantData string
+		want     bool
+	}{
+		{name: "not read yet", body: "hello world", maxBytes: 5, read: false, want: false},
+		{name: "shorter than the limit", body: "hey", maxBytes: 5, read: true, wantData: "hey", want: false},
+		{name: "exactly the limit", body: "hello", maxBytes: 5, read: true, wantData: "hello", want: false},
+		{name: "one byte over the limit", body: "hello!", maxBytes: 5, read: true, wantData: "hello", want: true},
+		{name: "unlimited", body: "hello world", maxBytes: 0, read: true, wantData: "hello world", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := NewBufferedBody(io.NopCloser(strings.NewReader(tt.body)), tt.maxBytes)
+			if tt.read {
+				data, err := io.ReadAll(body)
+				require.NoError(t, err)
+				require.Equal(t, tt.wantData, string(data))
+			}
+			require.Equal(t, tt.want, body.Truncated())
+		})
+	}
+}
+
+func TestBufferedBody_Replaced(t *testing.T) {
+	read := NewBufferedBody(io.NopCloser(strings.NewReader("client bytes")), 1024)
+	_, err := io.ReadAll(read)
+	require.NoError(t, err)
+	require.False(t, read.Replaced(), "a body that was only read is still the client's")
+
+	rewrapped := NewBufferedBodyFromBytes([]byte("client bytes"))
+	require.False(t, rewrapped.Replaced(), "re-wrapping unchanged bytes is not a replacement")
+
+	rewritten := NewBufferedBodyFromBytes([]byte("rewritten"))
+	rewritten.MarkReplaced()
+	require.True(t, rewritten.Replaced())
+}
+
+func TestBufferedBody_MarkTruncated(t *testing.T) {
+	// A rewrite of a truncated body keeps the flag, even if it is longer.
+	replacement := NewBufferedBodyFromBytes([]byte("a longer rewritten body"))
+	require.False(t, replacement.Truncated())
+	replacement.MarkTruncated()
+	require.True(t, replacement.Truncated())
+}
+
 func TestBufferedBody_Unlimited(t *testing.T) {
 	body := NewBufferedBody(io.NopCloser(strings.NewReader("hello world")), 0)
 

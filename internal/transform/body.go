@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"net/http"
 	"sync"
 )
 
@@ -16,14 +17,18 @@ import (
 // or upstream send.
 //
 // A maxBytes of 0 means unlimited; when the limit is exceeded the body is
-// truncated silently.
+// cut off at maxBytes. Reads do not report it, but Truncated does, so a
+// transform that must forward the whole body (or sign it) can refuse a
+// truncated one.
 type BufferedBody struct {
-	once     sync.Once
-	mu       sync.Mutex // protects pos only
-	original io.ReadCloser
-	data     []byte
-	pos      int
-	maxBytes int64
+	once      sync.Once
+	mu        sync.Mutex // protects pos only
+	original  io.ReadCloser
+	data      []byte
+	pos       int
+	maxBytes  int64
+	truncated bool
+	replaced  bool
 }
 
 // NewBufferedBody wraps an io.ReadCloser for lazy buffering. maxBytes caps
@@ -36,7 +41,10 @@ func NewBufferedBody(body io.ReadCloser, maxBytes int64) *BufferedBody {
 }
 
 // NewBufferedBodyFromBytes creates a pre-buffered body from a byte slice.
-// Use this when a transform replaces the body with new content.
+// Use this when a transform replaces the body with new content, and call
+// MarkReplaced on it when the bytes differ from what the client sent. To
+// re-read a body without changing it, Reset the existing body instead, which
+// keeps its Truncated state.
 func NewBufferedBodyFromBytes(data []byte) *BufferedBody {
 	b := &BufferedBody{data: data}
 	b.once.Do(func() {}) // mark as already buffered
@@ -67,13 +75,48 @@ func (b *BufferedBody) buffer() error {
 	b.once.Do(func() {
 		var r io.Reader = b.original
 		if b.maxBytes > 0 {
-			r = io.LimitReader(r, b.maxBytes)
+			// Read one byte past the limit to tell "exactly maxBytes" from
+			// "more than maxBytes".
+			r = io.LimitReader(r, b.maxBytes+1)
 		}
 		b.data, err = io.ReadAll(r)
+		if b.maxBytes > 0 && int64(len(b.data)) > b.maxBytes {
+			b.data = b.data[:b.maxBytes]
+			b.truncated = true
+		}
 		b.original.Close()
 		b.original = nil
 	})
 	return err
+}
+
+// Truncated reports whether the body was cut off at maxBytes when it was
+// buffered. It is false for a body that has not been buffered, and for one
+// that fitted.
+func (b *BufferedBody) Truncated() bool {
+	return b.truncated
+}
+
+// Replaced reports whether a transform changed the body's bytes (it called
+// MarkReplaced). Formats whose framing or checksum covers the body
+// (aws-chunked uploads with a checksum trailer) cannot survive that.
+func (b *BufferedBody) Replaced() bool {
+	return b.replaced
+}
+
+// MarkReplaced flags a body whose bytes a transform changed. Transforms that
+// rewrite a body (secrets, credential_mask, grpc) call it on the replacement.
+// Re-wrapping the client's unchanged bytes must not call it.
+func (b *BufferedBody) MarkReplaced() {
+	b.replaced = true
+}
+
+// MarkTruncated flags a body as truncated. A transform that replaces a
+// truncated body with rewritten bytes (NewBufferedBodyFromBytes) calls it on
+// the replacement, so the truncation is not lost: the rewrite may even be
+// longer than the original.
+func (b *BufferedBody) MarkTruncated() {
+	b.truncated = true
 }
 
 // Reset rewinds the read position to the beginning so the body can be
@@ -117,6 +160,19 @@ func (b *BufferedBody) Close() error {
 		return err
 	}
 	return nil
+}
+
+// RewindRequestBody makes req.Body readable from the start again after a
+// transform read it without changing it (to hash or sign it). It rewinds the
+// existing BufferedBody, which keeps its Truncated and Replaced state, rather
+// than re-wrapping data, which would lose them. data is used only when the body
+// is not a BufferedBody.
+func RewindRequestBody(req *http.Request, data []byte) {
+	if b, ok := req.Body.(*BufferedBody); ok {
+		b.Reset()
+		return
+	}
+	req.Body = NewBufferedBodyFromBytes(data)
 }
 
 // RequireBufferedBody asserts that body is a *BufferedBody and returns it.

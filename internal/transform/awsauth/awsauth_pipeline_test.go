@@ -2,13 +2,16 @@ package awsauth
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/ironsh/iron-proxy/internal/transform"
+	_ "github.com/ironsh/iron-proxy/internal/transform/hmacsign" // registers hmac_sign
 )
 
 // The "secrets" transform is registered because awsauth.go imports its
@@ -58,4 +61,235 @@ secrets:
 	_, rejected = post("the-clients-own-key")
 	require.NotNil(t, rejected, "nothing was swapped, so the write is blocked")
 	require.Equal(t, http.StatusForbidden, rejected.StatusCode)
+}
+
+// A secrets body swap that shortens the body, followed by aws_auth in a
+// mode that signs without reading the body: the swap keeps ContentLength in
+// step, so aws_auth must not mistake the rewrite for a truncated body.
+func TestDeclaredPayload_PipelineAfterShorterSecretsBodySwap(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("UPLOAD_TOKEN", "short") // shorter than the placeholder
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	secretsTr := build("secrets", `
+secrets:
+  - source: {type: env, var: UPLOAD_TOKEN}
+    rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
+    replace:
+      proxy_value: "proxy-upload-token"
+      match_body: true
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	tests := []struct {
+		name     string
+		declared string
+	}{
+		{name: "client declares UNSIGNED-PAYLOAD", declared: "UNSIGNED-PAYLOAD"},
+		{name: "client declares a hex hash (hashed by the proxy)", declared: ""}, // set below
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := `{"token":"proxy-upload-token","data":"x"}`
+			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+			require.NoError(t, err)
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+			req.ContentLength = int64(len(body))
+			req.Header.Set("Authorization", placeholderAuth)
+			declared := tt.declared
+			if declared == "" {
+				declared = sha256Hex([]byte(body))
+			}
+			req.Header.Set("X-Amz-Content-Sha256", declared)
+
+			var traces []transform.TransformTrace
+			rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+			require.NoError(t, err)
+			require.Nil(t, rejected, "a shorter body from the swap is not a truncated body")
+
+			want := `{"token":"short","data":"x"}`
+			require.Equal(t, int64(len(want)), req.ContentLength)
+			require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+			sent, err := io.ReadAll(transform.RequireBufferedBody(req.Body).StreamingReader())
+			require.NoError(t, err)
+			require.Equal(t, want, string(sent))
+		})
+	}
+}
+
+// A body cut off at the buffer limit, then made longer by a secrets swap,
+// can end up as long as its original Content-Length. aws_auth must still
+// refuse it on the paths that sign without reading the body: the truncation
+// is carried over by the swap, not inferred from the length.
+func TestDeclaredPayload_PipelineRefusesExpandedTruncatedBody(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("UPLOAD_TOKEN", strings.Repeat("R", 100)) // much longer than the placeholder
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	secretsTr := build("secrets", `
+secrets:
+  - source: {type: env, var: UPLOAD_TOKEN}
+    rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
+    replace:
+      proxy_value: "proxy-upload-token"
+      match_body: true
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	prefix := `{"token":"proxy-upload-token"}`
+	body := prefix + strings.Repeat(" ", 64) // the padding is cut off by the limit
+	req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), int64(len(prefix)))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Authorization", placeholderAuth)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+
+	var traces []transform.TransformTrace
+	rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+	require.NoError(t, err)
+
+	// The scenario is real: the rewrite is at least as long as the original.
+	require.GreaterOrEqual(t, transform.RequireBufferedBody(req.Body).Len(), len(body))
+	require.NotNil(t, rejected, "a truncated body must not be signed, however long the rewrite")
+	require.Equal(t, http.StatusRequestEntityTooLarge, rejected.StatusCode)
+}
+
+// An aws-chunked upload with a checksum trailer carries chunk sizes and a
+// checksum of its payload, so a secrets body swap inside it makes the upload
+// malformed. aws_auth refuses it with a clear reason; a body secrets only
+// read (no placeholder in it) is still the client's and is signed.
+func TestDeclaredPayload_PipelineTrailerModeAfterSecretsBodySwap(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("UPLOAD_TOKEN", "real-upload-token")
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	secretsTr := build("secrets", `
+secrets:
+  - source: {type: env, var: UPLOAD_TOKEN}
+    rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
+    replace:
+      proxy_value: "proxy-upload-token"
+      match_body: true
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	tests := []struct {
+		name         string
+		body         string
+		wantRejected bool
+	}{
+		{name: "placeholder in the body: swapped, so refused", body: "11\r\nproxy-upload-token\r\n0\r\nx-amz-checksum-crc64nvme:abc=\r\n\r\n", wantRejected: true},
+		{name: "no placeholder: only read, so signed", body: "5\r\nhello\r\n0\r\nx-amz-checksum-crc64nvme:abc=\r\n\r\n", wantRejected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+			require.NoError(t, err)
+			req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(tt.body)), 1<<20)
+			req.ContentLength = -1
+			req.Header.Set("Authorization", placeholderAuth)
+			req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+			req.Header.Set("Content-Encoding", "aws-chunked")
+
+			var traces []transform.TransformTrace
+			rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+			require.NoError(t, err)
+			if !tt.wantRejected {
+				require.Nil(t, rejected)
+				require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+				return
+			}
+			require.NotNil(t, rejected)
+			require.Equal(t, http.StatusBadRequest, rejected.StatusCode)
+			body, err := io.ReadAll(rejected.Body)
+			require.NoError(t, err)
+			require.Contains(t, string(body), "chunked_upload_body_rewritten")
+		})
+	}
+}
+
+// hmac_sign (with allow_chunked_body) reads the body to sign it but leaves its
+// bytes unchanged. A trailer-mode upload that passes through it first must
+// still be signed by aws_auth: reading is not rewriting.
+func TestDeclaredPayload_PipelineTrailerModeAfterHMACSignRead(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("HMAC_KEY", "key-id")
+	t.Setenv("HMAC_SECRET", "c2VjcmV0") // base64 "secret"
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	hmacTr := build("hmac_sign", `
+timestamp:
+  format: unix_seconds
+signature:
+  algorithm: sha256
+  key_encoding: base64
+  output_encoding: base64
+  message: "{{.Timestamp}}{{.Body}}"
+credentials:
+  key:    {type: env, var: HMAC_KEY}
+  secret: {type: env, var: HMAC_SECRET}
+headers:
+  - name: "X-Test-Sign"
+    value: "{{.Signature}}"
+allow_chunked_body: true
+rules:
+  - host: "*.s3.af-south-1.amazonaws.com"
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{hmacTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	body := "5\r\nhello\r\n0\r\nx-amz-checksum-crc64nvme:abc=\r\n\r\n"
+	req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), 1<<20)
+	req.ContentLength = -1
+	req.Header.Set("Authorization", placeholderAuth)
+	req.Header.Set("X-Amz-Content-Sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	req.Header.Set("Content-Encoding", "aws-chunked")
+
+	var traces []transform.TransformTrace
+	rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+	require.NoError(t, err)
+	require.Nil(t, rejected, "hmac_sign only read the body, so the upload is still the client's")
+	require.NotEmpty(t, req.Header.Get("X-Test-Sign"), "hmac_sign ran")
+	require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+	sent, err := io.ReadAll(transform.RequireBufferedBody(req.Body).StreamingReader())
+	require.NoError(t, err)
+	require.Equal(t, body, string(sent))
 }

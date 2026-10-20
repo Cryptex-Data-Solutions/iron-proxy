@@ -17,11 +17,24 @@
 //     agent should never see.
 //
 // Like hmac_sign, this requires MITM mode: sni-only mode has no method, path,
-// or body to sign. A truncated body would produce an invalid signature, so
-// bodies shorter than Content-Length and chunked bodies are rejected by
-// default; set allow_chunked_body: true to opt out of the chunked check, or
-// unsigned_payload: true to sign without buffering the body at all (S3
-// streaming uploads, etc.).
+// or body to sign.
+//
+// The payload hash is chosen in this order (see payloadHash):
+//   - The client declared UNSIGNED-PAYLOAD or STREAMING-UNSIGNED-PAYLOAD-TRAILER
+//     (current SDKs' checksummed S3 uploads): kept, and the body is streamed
+//     unread. Other STREAMING-* modes are refused.
+//   - unsigned_payload: true: signed as UNSIGNED-PAYLOAD, body unread.
+//   - Otherwise the body is hashed. A truncated body would produce an invalid
+//     signature, so bodies shorter than Content-Length and chunked bodies are
+//     rejected by default; allow_chunked_body: true opts out of the chunked
+//     check.
+//
+// A body an earlier transform already buffered may have been cut off at the
+// proxy's body limit, so it gets the same length checks in every case. A
+// transform placed after aws_auth cannot be checked here: if it reads or
+// rewrites the body, the request no longer matches its signature (or, for an
+// unread body, is cut off after signing). Place aws_auth after every
+// transform that reads or rewrites request bodies.
 //
 // Setting placeholder_access_key_id (Cryptex addition) replaces "re-sign
 // every SigV4 request, reject everything else" with a write policy: only
@@ -60,6 +73,10 @@ const (
 	// unsignedPayload is the literal placeholder AWS accepts in lieu of a real
 	// SHA-256 payload hash. S3, Bedrock streaming, etc. document this value.
 	unsignedPayload = "UNSIGNED-PAYLOAD"
+	// streamingUnsignedPayloadTrailer is the payload mode current AWS SDKs
+	// declare for checksummed aws-chunked uploads over HTTPS: the body is not
+	// hashed into the signature, and a checksum trailer follows the chunks.
+	streamingUnsignedPayloadTrailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 
 	// emptyPayloadSHA256 is the hex SHA-256 of the empty string, used when the
 	// request has no body. Per the SDK docs SignHTTP always requires a payload
@@ -470,13 +487,74 @@ func stripInboundSignatureHeaders(req *http.Request) {
 	req.Header.Del("X-Amz-Content-Sha256")
 }
 
-// payloadHash returns the SHA-256 hex hash of the request body, or the
-// UNSIGNED-PAYLOAD sentinel when unsigned_payload is set. It reuses
-// hmac_sign's body-verification policy: a truncated body or (by default) a
-// chunked body produces a clean proxy-side rejection rather than a request
-// the upstream will reject with an opaque "signature mismatch" error.
+// payloadHash returns the client's own declared mode when that mode leaves
+// the body unsigned, otherwise the UNSIGNED-PAYLOAD sentinel when
+// unsigned_payload is set, otherwise the SHA-256 hex hash of the request
+// body. It reuses hmac_sign's body-verification policy: a truncated body or
+// (by default) a chunked body produces a clean proxy-side rejection rather
+// than a request the upstream will reject with an opaque "signature
+// mismatch" error, or accept with part of the body missing.
 func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Request) (string, *transform.TransformResult) {
+	// Keep the client's payload mode when the body is not part of the
+	// signature. Current AWS SDKs send S3 uploads as aws-chunked bodies with
+	// a checksum trailer, declared as STREAMING-UNSIGNED-PAYLOAD-TRAILER, and
+	// with no length known up front. Hashing that body here would buffer the
+	// whole upload, fail on the missing length, and replace the declared mode
+	// with one S3 rejects for an aws-chunked body. S3 checks the trailer
+	// checksum itself, so the body is left unread. This runs before the
+	// unsigned_payload setting: replacing the trailer mode with
+	// UNSIGNED-PAYLOAD is just as invalid for an aws-chunked body. A declared
+	// hex hash still takes the paths below: an earlier transform may have
+	// rewritten the body, and the hash must match what is actually sent.
+	//
+	// The audit annotations below are fixed labels of our own, never the
+	// header value or the AWS mode name: the value is client controlled, and
+	// an earlier transform (secrets matching every header, its default) may
+	// have swapped a real secret into it, even one that equals a mode name.
+	declared := req.Header.Get("X-Amz-Content-Sha256")
+	switch {
+	case declared == streamingUnsignedPayloadTrailer || declared == unsignedPayload:
+		if reject := a.checkAlreadyBufferedBody(tctx, req); reject != nil {
+			return "", reject
+		}
+		if declared == streamingUnsignedPayloadTrailer {
+			// The aws-chunked body carries the client's chunk sizes and a
+			// checksum of the payload in its trailer. If an earlier transform
+			// rewrote it (secrets matching in the body), both are now wrong
+			// and S3 would reject the upload as malformed or failing its
+			// checksum. Refuse it here with a clear reason instead.
+			if buffered, ok := req.Body.(*transform.BufferedBody); ok && buffered.Replaced() {
+				tctx.Annotate("rejected", "chunked_upload_body_rewritten")
+				return "", &transform.TransformResult{
+					Action:   transform.ActionReject,
+					Response: errorResponse(req, http.StatusBadRequest, "chunked_upload_body_rewritten"),
+				}
+			}
+			tctx.Annotate("payload", "client_declared_unsigned_trailer")
+		} else {
+			tctx.Annotate("payload", "client_declared_unsigned")
+		}
+		return declared, nil
+	case strings.HasPrefix(declared, "STREAMING-"):
+		// The other STREAMING-* modes sign the body as it streams:
+		// STREAMING-AWS4-HMAC-SHA256-PAYLOAD and its TRAILER and ECDSA variants
+		// sign every chunk, and STREAMING-AWS4-HMAC-SHA256-EVENTS signs every
+		// event-stream message (Transcribe streaming, Lex, Bedrock
+		// bidirectional streams). Each signature is chained from the request
+		// signature and made with the client's key, so re-signing only the
+		// headers can never produce a request upstream accepts.
+		tctx.Annotate("rejected", "signed_streaming_payload_not_supported")
+		tctx.Annotate("payload", "client_declared_signed_streaming")
+		return "", &transform.TransformResult{
+			Action:   transform.ActionReject,
+			Response: errorResponse(req, http.StatusBadRequest, "signed_streaming_payload_not_supported"),
+		}
+	}
+
 	if a.unsignedPayload {
+		if reject := a.checkAlreadyBufferedBody(tctx, req); reject != nil {
+			return "", reject
+		}
 		return unsignedPayload, nil
 	}
 
@@ -502,8 +580,13 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 		}
 	}
 
+	truncated := false
+	if buffered, ok := req.Body.(*transform.BufferedBody); ok {
+		truncated = buffered.Truncated()
+	}
+
 	switch {
-	case req.ContentLength >= 0 && int64(len(body)) < req.ContentLength:
+	case truncated || (req.ContentLength >= 0 && int64(len(body)) < req.ContentLength):
 		tctx.Annotate("rejected", "body_truncated")
 		tctx.Annotate("content_length", req.ContentLength)
 		tctx.Annotate("buffered_length", len(body))
@@ -525,7 +608,7 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 		)
 	}
 
-	req.Body = transform.NewBufferedBodyFromBytes(body)
+	transform.RewindRequestBody(req, body)
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:]), nil
 }
@@ -538,6 +621,32 @@ func (a *AWSAuth) rejectCredentialUnavailable(tctx *transform.TransformContext, 
 		Action:   transform.ActionReject,
 		Response: errorResponse(req, http.StatusBadGateway, "credential_unavailable"),
 	}
+}
+
+// checkAlreadyBufferedBody guards the paths that sign without reading the
+// body. An unread body is streamed upstream in full, so nothing needs
+// checking. But if an earlier transform read it (body_capture, or secrets
+// matching in the body), BufferedBody kept only the first
+// max_request_body_bytes and closed the original, and the proxy will send that
+// prefix. Refuse it (413) when the body says it was truncated, which a
+// rewriting transform carries over to its replacement, or when it is shorter
+// than its Content-Length. The length alone is not enough: a rewrite can make
+// a truncated body as long as the original. Returns nil to continue.
+func (a *AWSAuth) checkAlreadyBufferedBody(tctx *transform.TransformContext, req *http.Request) *transform.TransformResult {
+	buffered, ok := req.Body.(*transform.BufferedBody)
+	if !ok || buffered.Len() < 0 {
+		return nil
+	}
+	if buffered.Truncated() || (req.ContentLength >= 0 && int64(buffered.Len()) < req.ContentLength) {
+		tctx.Annotate("rejected", "body_truncated")
+		tctx.Annotate("content_length", req.ContentLength)
+		tctx.Annotate("buffered_length", buffered.Len())
+		return &transform.TransformResult{
+			Action:   transform.ActionReject,
+			Response: errorResponse(req, http.StatusRequestEntityTooLarge, "body_truncated"),
+		}
+	}
+	return nil
 }
 
 func errorResponse(req *http.Request, status int, reason string) *http.Response {

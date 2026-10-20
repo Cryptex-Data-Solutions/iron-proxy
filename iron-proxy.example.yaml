@@ -539,10 +539,29 @@ transforms:
   #   AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
   # then point the SDK at this proxy. The real keys never leave the proxy.
   #
-  # Requires MITM mode. Bodies shorter than Content-Length → 413, chunked
-  # bodies → 400 unless allow_chunked_body: true. For streaming uploads or any
-  # case where the body must not be buffered (S3 multipart, etc.) set
-  # unsigned_payload: true.
+  # Requires MITM mode.
+  #
+  # The client's declared payload mode is kept when it leaves the body
+  # unsigned: X-Amz-Content-Sha256 of UNSIGNED-PAYLOAD or
+  # STREAMING-UNSIGNED-PAYLOAD-TRAILER (what current AWS SDKs send for
+  # checksummed S3 uploads, including multipart parts) is re-signed as is,
+  # and the body is streamed without being read, whatever its size. This
+  # applies whatever unsigned_payload is set to. Streams that sign the body as
+  # it goes (STREAMING-AWS4-HMAC-SHA256-PAYLOAD..., -EVENTS) → 400, since
+  # each chunk or event carries a signature made with the client's key.
+  # If an earlier transform already read the body (body_capture, secrets
+  # matching in the body), it may have been cut off at the body limit: a
+  # body that was cut off is refused with 413 in every mode, even if a
+  # rewrite made it longer again. Place aws_auth after every
+  # transform that reads or rewrites request bodies: one that runs after it
+  # changes or cuts off a body that is already signed.
+  #
+  # Otherwise (no declared mode, or a declared hex hash) the body is hashed:
+  # bodies shorter than Content-Length → 413, bodies over the proxy's body
+  # limit → 413, chunked bodies → 400 unless allow_chunked_body: true. Set
+  # unsigned_payload: true to sign these as UNSIGNED-PAYLOAD instead and
+  # stream them unread, for example large uploads from clients that send a
+  # hex hash.
   #
   # - name: aws_auth
   #   config:
