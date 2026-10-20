@@ -819,6 +819,10 @@ still applies, and the bytes pass through undecrypted. The decision follows
 the SNI, not the CONNECT target, so a client cannot CONNECT to a tunnelled
 host and then talk to an intercepted one undecrypted.
 
+The lists are read at startup. Changing them needs a restart: `POST
+/v1/reload` refuses a config whose lists differ from the running ones (422)
+rather than reporting success while ignoring the change.
+
 ## Routing traffic to the proxy
 
 There are three approaches, with increasing enforcement.

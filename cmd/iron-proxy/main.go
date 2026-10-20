@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -270,7 +271,7 @@ func main() {
 			mgmtOpts.Status = func() any { return poller.Status() }
 			mgmtOpts.SyncNow = poller.Poke
 		} else {
-			mgmtOpts.Reload = newReloadFunc(*configPath, holder, mcpHolder, gatewayHolder, pgManager, bodyLimits, logger)
+			mgmtOpts.Reload = newReloadFunc(*configPath, cfg.TLS, holder, mcpHolder, gatewayHolder, pgManager, bodyLimits, logger)
 		}
 		mgmtServer = management.New(mgmtOpts)
 	}
@@ -674,14 +675,19 @@ func applyPostgresSync(ctx context.Context, mgr *postgres.Manager, local *postgr
 // and atomically swaps them in. Parse, validation, and build errors are
 // wrapped in *management.ValidationError so the management server returns
 // 422 and the existing state is left untouched. Validation runs for every
-// component before any state is mutated.
-func newReloadFunc(configPath string, holder *transform.PipelineHolder, mcpHolder *mcp.PolicyHolder, gatewayHolder *mcpgateway.Holder, pgManager *postgres.Manager, bodyLimits transform.BodyLimits, logger *slog.Logger) management.ReloadFunc {
+// component before any state is mutated. runningTLS is the TLS config the
+// proxy started with; a reload that changes its interception lists is
+// rejected (see checkInterceptUnchanged).
+func newReloadFunc(configPath string, runningTLS config.TLS, holder *transform.PipelineHolder, mcpHolder *mcp.PolicyHolder, gatewayHolder *mcpgateway.Holder, pgManager *postgres.Manager, bodyLimits transform.BodyLimits, logger *slog.Logger) management.ReloadFunc {
 	return func(ctx context.Context) error {
 		newCfg, err := config.LoadConfig(configPath)
 		if err != nil {
 			return &management.ValidationError{Err: err}
 		}
 		if err := config.Validate(newCfg); err != nil {
+			return &management.ValidationError{Err: err}
+		}
+		if err := checkInterceptUnchanged(runningTLS, newCfg.TLS); err != nil {
 			return &management.ValidationError{Err: err}
 		}
 		newPipeline, err := buildPipeline(newCfg.Transforms, bodyLimits, logger)
@@ -711,6 +717,40 @@ func newReloadFunc(configPath string, holder *transform.PipelineHolder, mcpHolde
 		)
 		return nil
 	}
+}
+
+// checkInterceptUnchanged rejects a reload whose tls.intercept or
+// tls.intercept_exclude differs from the running config. Which hosts are
+// decrypted is wired into the listeners at startup, and reload only rebuilds
+// the pipeline, so a changed list would be silently ignored while reload
+// reported success. The lists are compared as sets of lowercased hosts:
+// order, duplicate entries and letter case do not change which hosts are
+// decrypted (host matching ignores case), so they do not count.
+func checkInterceptUnchanged(running, next config.TLS) error {
+	lists := []struct {
+		name          string
+		running, next []string
+	}{
+		{"tls.intercept", running.Intercept, next.Intercept},
+		{"tls.intercept_exclude", running.InterceptExclude, next.InterceptExclude},
+	}
+	for _, l := range lists {
+		if !slices.Equal(interceptHostSet(l.running), interceptHostSet(l.next)) {
+			return fmt.Errorf("%s changed: interception lists are applied at startup only; restart iron-proxy to change them", l.name)
+		}
+	}
+	return nil
+}
+
+// interceptHostSet returns hosts lowercased, sorted and without duplicates,
+// so two lists that intercept the same hosts compare equal.
+func interceptHostSet(hosts []string) []string {
+	set := make([]string, len(hosts))
+	for i, h := range hosts {
+		set[i] = strings.ToLower(h)
+	}
+	slices.Sort(set)
+	return slices.Compact(set)
 }
 
 // buildPipeline creates a transform.Pipeline from config transforms.
