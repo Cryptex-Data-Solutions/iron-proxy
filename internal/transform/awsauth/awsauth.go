@@ -568,8 +568,13 @@ func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Reques
 		}
 	}
 
+	truncated := false
+	if buffered, ok := req.Body.(*transform.BufferedBody); ok {
+		truncated = buffered.Truncated()
+	}
+
 	switch {
-	case req.ContentLength >= 0 && int64(len(body)) < req.ContentLength:
+	case truncated || (req.ContentLength >= 0 && int64(len(body)) < req.ContentLength):
 		tctx.Annotate("rejected", "body_truncated")
 		tctx.Annotate("content_length", req.ContentLength)
 		tctx.Annotate("buffered_length", len(body))
@@ -611,30 +616,22 @@ func (a *AWSAuth) rejectCredentialUnavailable(tctx *transform.TransformContext, 
 // checking. But if an earlier transform read it (body_capture, or secrets
 // matching in the body), BufferedBody kept only the first
 // max_request_body_bytes and closed the original, and the proxy will send that
-// prefix. Apply the same checks as the hashing path: a body shorter than its
-// Content-Length is refused, and a chunked body, whose truncation cannot be
-// detected, is refused unless allow_chunked_body is set. Returns nil to
-// continue.
+// prefix. Refuse it (413) when the body says it was truncated, which a
+// rewriting transform carries over to its replacement, or when it is shorter
+// than its Content-Length. The length alone is not enough: a rewrite can make
+// a truncated body as long as the original. Returns nil to continue.
 func (a *AWSAuth) checkAlreadyBufferedBody(tctx *transform.TransformContext, req *http.Request) *transform.TransformResult {
 	buffered, ok := req.Body.(*transform.BufferedBody)
 	if !ok || buffered.Len() < 0 {
 		return nil
 	}
-	switch {
-	case req.ContentLength >= 0 && int64(buffered.Len()) < req.ContentLength:
+	if buffered.Truncated() || (req.ContentLength >= 0 && int64(buffered.Len()) < req.ContentLength) {
 		tctx.Annotate("rejected", "body_truncated")
 		tctx.Annotate("content_length", req.ContentLength)
 		tctx.Annotate("buffered_length", buffered.Len())
 		return &transform.TransformResult{
 			Action:   transform.ActionReject,
 			Response: errorResponse(req, http.StatusRequestEntityTooLarge, "body_truncated"),
-		}
-	case req.ContentLength < 0 && !a.allowChunkedBody:
-		tctx.Annotate("rejected", "chunked_body_not_allowed")
-		tctx.Annotate("buffered_length", buffered.Len())
-		return &transform.TransformResult{
-			Action:   transform.ActionReject,
-			Response: errorResponse(req, http.StatusBadRequest, "chunked_body_not_allowed"),
 		}
 	}
 	return nil

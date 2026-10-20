@@ -549,8 +549,9 @@ transforms:
   # it goes (STREAMING-AWS4-HMAC-SHA256-PAYLOAD..., -EVENTS) → 400, since
   # each chunk or event carries a signature made with the client's key.
   # If an earlier transform already read the body (body_capture, secrets
-  # matching in the body), it may have been cut off at the body limit, so
-  # the checks below apply to it in every mode. Place aws_auth after every
+  # matching in the body), it may have been cut off at the body limit: a
+  # body that was cut off is refused with 413 in every mode, even if a
+  # rewrite made it longer again. Place aws_auth after every
   # transform that reads or rewrites request bodies: one that runs after it
   # changes or cuts off a body that is already signed.
   #

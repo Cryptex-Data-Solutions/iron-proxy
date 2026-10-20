@@ -589,3 +589,34 @@ func TestSendResponseBody_UncappedDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, bigBody, srv.lastRespProto.GetResponse().GetBody())
 }
+
+// A plugin that replaces the body of a request whose body was cut off at the
+// proxy's limit built its replacement from the truncated bytes, so the
+// request stays marked as truncated for later transforms (aws_auth).
+func TestApplyModifiedRequest_CarriesTruncation(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		limit    int64
+		wantFlag bool
+	}{
+		{name: "complete original", body: "short", limit: 1 << 20, wantFlag: false},
+		{name: "truncated original", body: "a body longer than the limit", limit: 4, wantFlag: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPost, "https://example.com/x", nil)
+			require.NoError(t, err)
+			original := transform.NewBufferedBody(io.NopCloser(bytes.NewReader([]byte(tt.body))), tt.limit)
+			_, err = io.ReadAll(original) // the body was buffered to send it to the plugin
+			require.NoError(t, err)
+			req.Body = original
+
+			applyModifiedRequest(&transformv1.HttpRequest{Body: []byte("a much longer replacement body from the plugin")}, req)
+
+			replaced := transform.RequireBufferedBody(req.Body)
+			require.Equal(t, tt.wantFlag, replaced.Truncated())
+			require.Equal(t, int64(replaced.Len()), req.ContentLength)
+		})
+	}
+}

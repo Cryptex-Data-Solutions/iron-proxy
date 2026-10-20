@@ -223,6 +223,7 @@ func TestSecrets_BodySwapContentLength(t *testing.T) {
 		contentLength int64
 		bufferLimit   int64
 		wantLength    int64
+		wantTruncated bool
 	}{
 		{
 			name:          "complete body: length follows the shorter replacement",
@@ -239,11 +240,12 @@ func TestSecrets_BodySwapContentLength(t *testing.T) {
 			wantLength:    -1,
 		},
 		{
-			name:          "truncated body: original length kept so truncation stays visible",
+			name:          "truncated body: original length kept and truncation carried over",
 			body:          long,
 			contentLength: int64(len(long)),
 			bufferLimit:   int64(len(complete)), // cuts off the trailing spaces
 			wantLength:    int64(len(long)),
+			wantTruncated: true,
 		},
 	}
 	for _, tt := range tests {
@@ -259,6 +261,7 @@ func TestSecrets_BodySwapContentLength(t *testing.T) {
 			doTransform(t, s, req)
 
 			require.Equal(t, tt.wantLength, req.ContentLength)
+			require.Equal(t, tt.wantTruncated, transform.RequireBufferedBody(req.Body).Truncated())
 			got, err := io.ReadAll(req.Body)
 			require.NoError(t, err)
 			require.Contains(t, string(got), real)

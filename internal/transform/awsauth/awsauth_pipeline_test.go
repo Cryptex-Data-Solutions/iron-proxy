@@ -124,3 +124,50 @@ secrets:
 		})
 	}
 }
+
+// A body cut off at the buffer limit, then made longer by a secrets swap,
+// can end up as long as its original Content-Length. aws_auth must still
+// refuse it on the paths that sign without reading the body: the truncation
+// is carried over by the swap, not inferred from the length.
+func TestDeclaredPayload_PipelineRefusesExpandedTruncatedBody(t *testing.T) {
+	t.Setenv("AWS_ACCESS_KEY_ID", realKeyID)
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "real-secret")
+	t.Setenv("UPLOAD_TOKEN", strings.Repeat("R", 100)) // much longer than the placeholder
+
+	build := func(name, cfg string) transform.Transformer {
+		t.Helper()
+		factory, err := transform.Lookup(name)
+		require.NoError(t, err)
+		tr, err := factory(yamlFromString(t, cfg), slog.Default())
+		require.NoError(t, err)
+		return tr
+	}
+	secretsTr := build("secrets", `
+secrets:
+  - source: {type: env, var: UPLOAD_TOKEN}
+    rules: [{host: "*.s3.af-south-1.amazonaws.com"}]
+    replace:
+      proxy_value: "proxy-upload-token"
+      match_body: true
+`)
+	awsTr := build("aws_auth", minimalYAML)
+	pipeline := transform.NewPipeline([]transform.Transformer{secretsTr, awsTr}, transform.BodyLimits{}, slog.Default())
+
+	prefix := `{"token":"proxy-upload-token"}`
+	body := prefix + strings.Repeat(" ", 64) // the padding is cut off by the limit
+	req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.af-south-1.amazonaws.com/key", nil)
+	require.NoError(t, err)
+	req.Body = transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), int64(len(prefix)))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Authorization", placeholderAuth)
+	req.Header.Set("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+
+	var traces []transform.TransformTrace
+	rejected, err := pipeline.ProcessRequest(context.Background(), newContext(), req, &traces)
+	require.NoError(t, err)
+
+	// The scenario is real: the rewrite is at least as long as the original.
+	require.GreaterOrEqual(t, transform.RequireBufferedBody(req.Body).Len(), len(body))
+	require.NotNil(t, rejected, "a truncated body must not be signed, however long the rewrite")
+	require.Equal(t, http.StatusRequestEntityTooLarge, rejected.StatusCode)
+}

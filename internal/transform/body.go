@@ -16,14 +16,17 @@ import (
 // or upstream send.
 //
 // A maxBytes of 0 means unlimited; when the limit is exceeded the body is
-// truncated silently.
+// cut off at maxBytes. Reads do not report it, but Truncated does, so a
+// transform that must forward the whole body (or sign it) can refuse a
+// truncated one.
 type BufferedBody struct {
-	once     sync.Once
-	mu       sync.Mutex // protects pos only
-	original io.ReadCloser
-	data     []byte
-	pos      int
-	maxBytes int64
+	once      sync.Once
+	mu        sync.Mutex // protects pos only
+	original  io.ReadCloser
+	data      []byte
+	pos       int
+	maxBytes  int64
+	truncated bool
 }
 
 // NewBufferedBody wraps an io.ReadCloser for lazy buffering. maxBytes caps
@@ -67,13 +70,34 @@ func (b *BufferedBody) buffer() error {
 	b.once.Do(func() {
 		var r io.Reader = b.original
 		if b.maxBytes > 0 {
-			r = io.LimitReader(r, b.maxBytes)
+			// Read one byte past the limit to tell "exactly maxBytes" from
+			// "more than maxBytes".
+			r = io.LimitReader(r, b.maxBytes+1)
 		}
 		b.data, err = io.ReadAll(r)
+		if b.maxBytes > 0 && int64(len(b.data)) > b.maxBytes {
+			b.data = b.data[:b.maxBytes]
+			b.truncated = true
+		}
 		b.original.Close()
 		b.original = nil
 	})
 	return err
+}
+
+// Truncated reports whether the body was cut off at maxBytes when it was
+// buffered. It is false for a body that has not been buffered, and for one
+// that fitted.
+func (b *BufferedBody) Truncated() bool {
+	return b.truncated
+}
+
+// MarkTruncated flags a body as truncated. A transform that replaces a
+// truncated body with rewritten bytes (NewBufferedBodyFromBytes) calls it on
+// the replacement, so the truncation is not lost: the rewrite may even be
+// longer than the original.
+func (b *BufferedBody) MarkTruncated() {
+	b.truncated = true
 }
 
 // Reset rewinds the read position to the beginning so the body can be

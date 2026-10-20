@@ -139,12 +139,20 @@ func TestTransformRequest_DeclaredPayloadMode(t *testing.T) {
 			wantStatus:    http.StatusRequestEntityTooLarge,
 		},
 		{
-			name:          "already buffered, chunked: truncation undetectable, refused",
+			name:          "already buffered and truncated, chunked: refused",
 			declared:      "UNSIGNED-PAYLOAD",
 			contentLength: -1,
 			preBuffered:   smallLimit,
 			wantAction:    transform.ActionReject,
-			wantStatus:    http.StatusBadRequest,
+			wantStatus:    http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:          "already buffered and complete, chunked: declared mode kept",
+			declared:      "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+			contentLength: -1,
+			preBuffered:   1 << 20,
+			wantAction:    transform.ActionContinue,
+			wantPayload:   "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
 		},
 		{
 			name:            "unsigned_payload set: already buffered and truncated is refused",
