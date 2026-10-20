@@ -543,6 +543,15 @@ transforms:
   # case where the body must not be buffered (S3 multipart, etc.) set
   # unsigned_payload: true.
   #
+  # The client's declared payload mode is kept when it leaves the body
+  # unsigned: X-Amz-Content-Sha256 of UNSIGNED-PAYLOAD or
+  # STREAMING-UNSIGNED-PAYLOAD-TRAILER (what current AWS SDKs send for
+  # checksummed S3 uploads) is re-signed as is, and the body is streamed
+  # without being read, whatever its size. Per-chunk signed streams
+  # (STREAMING-AWS4-HMAC-SHA256-PAYLOAD...) → 400, since each chunk carries
+  # a signature made with the client's key. A declared hex hash is
+  # recalculated from the body, so the rules above apply to it.
+  #
   # - name: aws_auth
   #   config:
   #     access_key_id:     {type: env, var: AWS_ACCESS_KEY_ID}

@@ -60,6 +60,10 @@ const (
 	// unsignedPayload is the literal placeholder AWS accepts in lieu of a real
 	// SHA-256 payload hash. S3, Bedrock streaming, etc. document this value.
 	unsignedPayload = "UNSIGNED-PAYLOAD"
+	// streamingUnsignedPayloadTrailer is the payload mode current AWS SDKs
+	// declare for checksummed aws-chunked uploads over HTTPS: the body is not
+	// hashed into the signature, and a checksum trailer follows the chunks.
+	streamingUnsignedPayloadTrailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 
 	// emptyPayloadSHA256 is the hex SHA-256 of the empty string, used when the
 	// request has no body. Per the SDK docs SignHTTP always requires a payload
@@ -470,14 +474,42 @@ func stripInboundSignatureHeaders(req *http.Request) {
 	req.Header.Del("X-Amz-Content-Sha256")
 }
 
-// payloadHash returns the SHA-256 hex hash of the request body, or the
-// UNSIGNED-PAYLOAD sentinel when unsigned_payload is set. It reuses
+// payloadHash returns the SHA-256 hex hash of the request body, the
+// UNSIGNED-PAYLOAD sentinel when unsigned_payload is set, or the client's own
+// declared mode when that mode leaves the body unsigned. It reuses
 // hmac_sign's body-verification policy: a truncated body or (by default) a
 // chunked body produces a clean proxy-side rejection rather than a request
 // the upstream will reject with an opaque "signature mismatch" error.
 func (a *AWSAuth) payloadHash(tctx *transform.TransformContext, req *http.Request) (string, *transform.TransformResult) {
 	if a.unsignedPayload {
 		return unsignedPayload, nil
+	}
+
+	// Keep the client's payload mode when the body is not part of the
+	// signature. Current AWS SDKs send S3 uploads as aws-chunked bodies with
+	// a checksum trailer, declared as STREAMING-UNSIGNED-PAYLOAD-TRAILER, and
+	// with no length known up front. Hashing that body here would buffer the
+	// whole upload, fail on the missing length, and replace the declared mode
+	// with one S3 rejects for an aws-chunked body. S3 checks the trailer
+	// checksum itself, so the body is left unread. A declared hex hash still
+	// takes the path below: an earlier transform may have rewritten the body,
+	// and the hash must match what is actually sent.
+	declared := req.Header.Get("X-Amz-Content-Sha256")
+	switch {
+	case declared == streamingUnsignedPayloadTrailer || declared == unsignedPayload:
+		tctx.Annotate("payload", declared)
+		return declared, nil
+	case strings.HasPrefix(declared, "STREAMING-"):
+		// STREAMING-AWS4-HMAC-SHA256-PAYLOAD and its variants sign every
+		// chunk, each signature chained from the request signature. Re-signing
+		// only the headers would leave chunk signatures made with the client's
+		// key, which upstream rejects partway through the upload.
+		tctx.Annotate("rejected", "signed_streaming_payload_not_supported")
+		tctx.Annotate("payload", declared)
+		return "", &transform.TransformResult{
+			Action:   transform.ActionReject,
+			Response: errorResponse(req, http.StatusBadRequest, "signed_streaming_payload_not_supported"),
+		}
 	}
 
 	if req.Body == nil || req.Body == http.NoBody {
