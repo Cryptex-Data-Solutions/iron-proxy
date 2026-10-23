@@ -300,6 +300,18 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 		}
 	}
 
+	// A presigned URL carries its signature in the query string. Re-signing
+	// only replaces headers, so the query signature would stay and the
+	// upstream would see two signatures and refuse the request. Refuse it
+	// here with a clear reason until query re-signing is supported.
+	if hasQuerySignature(req) {
+		tctx.Annotate("rejected", "presigned_url_not_supported")
+		return &transform.TransformResult{
+			Action:   transform.ActionReject,
+			Response: errorResponse(req, http.StatusBadRequest, "presigned_url_not_supported"),
+		}, nil
+	}
+
 	scope, err := parseInboundScope(req)
 	if err != nil {
 		tctx.Annotate("rejected", "missing_sigv4")
@@ -446,9 +458,28 @@ type credentialScope struct {
 
 var errNoSigV4 = errors.New("request has no SigV4 signature (no Authorization header or X-Amz-Credential query param)")
 
+// presignQueryParams are the query parameters that mark a SigV4 presigned
+// URL. Any one of them means the query string carries (part of) a signature.
+var presignQueryParams = []string{"X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Signature"}
+
+// hasQuerySignature reports whether the request is a presigned URL: its
+// query string carries a SigV4 signature that header re-signing would leave
+// in place.
+func hasQuerySignature(req *http.Request) bool {
+	query := req.URL.Query()
+	for _, name := range presignQueryParams {
+		if query.Has(name) {
+			return true
+		}
+	}
+	return false
+}
+
 // parseInboundScope extracts the credential scope from an inbound SigV4
 // signature. Normal requests carry the scope in the Authorization header;
-// pre-signed URLs carry it in the X-Amz-Credential query param.
+// pre-signed URLs carry it in the X-Amz-Credential query param. On the
+// re-sign path presigned URLs are refused before this runs
+// (hasQuerySignature), so in practice the scope comes from the header.
 func parseInboundScope(req *http.Request) (credentialScope, error) {
 	if auth := req.Header.Get("Authorization"); auth != "" {
 		return parseAuthHeaderScope(auth)

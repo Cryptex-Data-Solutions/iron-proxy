@@ -145,6 +145,14 @@ func TestWritePolicy(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name: "placeholder-signed request that also carries a presigned query is rejected",
+			build: func(t *testing.T) *http.Request {
+				return signedRequest(t, "GET", "https://my-bucket.s3.amazonaws.com/x?"+presignedQuery+foreignKeyID+"%2F20250101%2Fus-east-1%2Fs3%2Faws4_request", "us-east-1", "s3", nil, 0)
+			},
+			wantReject: true,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name: "unsigned POST to someone's API Gateway is rejected",
 			build: func(t *testing.T) *http.Request {
 				return plainRequest(t, "POST", "https://abc123.execute-api.us-east-1.amazonaws.com/collect", "Bearer some-jwt")
@@ -208,4 +216,66 @@ func TestWritePolicy_OffByDefault(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, transform.ActionContinue, res.Action)
 	require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+}
+
+// Re-signing replaces headers only. A presigned URL keeps its query
+// signature, so re-signing it would send two signatures, which the upstream
+// refuses. It is refused here instead, with or without the write policy.
+func TestPresignedURLIsNotResigned(t *testing.T) {
+	presigned := "https://my-bucket.s3.amazonaws.com/x?" + presignedQuery + foreignKeyID + "%2F20250101%2Fus-east-1%2Fs3%2Faws4_request"
+
+	tests := []struct {
+		name  string
+		cfg   string
+		build func(t *testing.T) *http.Request
+	}{
+		{
+			name:  "write policy off: presigned URL",
+			cfg:   minimalYAML,
+			build: func(t *testing.T) *http.Request { return plainRequest(t, "GET", presigned, "") },
+		},
+		{
+			name: "write policy off: header-signed request with a presigned query",
+			cfg:  minimalYAML,
+			build: func(t *testing.T) *http.Request {
+				return signedRequest(t, "PUT", presigned, "us-east-1", "s3", []byte("x"), 0)
+			},
+		},
+		{
+			name: "write policy on: placeholder-signed request with a presigned query",
+			cfg:  writePolicyYAML,
+			build: func(t *testing.T) *http.Request {
+				return signedRequest(t, "PUT", presigned, "us-east-1", "s3", []byte("x"), 0)
+			},
+		},
+		{
+			name: "only X-Amz-Signature in the query",
+			cfg:  minimalYAML,
+			build: func(t *testing.T) *http.Request {
+				return signedRequest(t, "GET", "https://my-bucket.s3.amazonaws.com/x?X-Amz-Signature=abc123", "us-east-1", "s3", nil, 0)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			a := writePolicyTransform(t, tc.cfg)
+			req := tc.build(t)
+			tctx := newContext()
+			res, err := a.TransformRequest(context.Background(), tctx, req)
+			require.NoError(t, err)
+			require.Equal(t, transform.ActionReject, res.Action)
+			require.Equal(t, http.StatusBadRequest, res.Response.StatusCode)
+			require.NotContains(t, tctx.CredentialsInjectedBy(), "aws_auth", "nothing may be signed")
+		})
+	}
+
+	t.Run("an ordinary query string is still re-signed", func(t *testing.T) {
+		a := writePolicyTransform(t, minimalYAML)
+		req := signedRequest(t, "GET", "https://my-bucket.s3.amazonaws.com/?list-type=2&prefix=a", "us-east-1", "s3", nil, 0)
+		res, err := a.TransformRequest(context.Background(), newContext(), req)
+		require.NoError(t, err)
+		require.Equal(t, transform.ActionContinue, res.Action)
+		require.Contains(t, req.Header.Get("Authorization"), "Credential="+realKeyID+"/")
+	})
 }
