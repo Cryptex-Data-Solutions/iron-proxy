@@ -347,8 +347,9 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 	stripInboundSignatureHeaders(req)
 	// Hop-by-hop headers never reach the upstream (the outbound transport
 	// drops them), so signing them would produce a signature the upstream
-	// cannot verify.
-	stripHopByHopHeaders(req)
+	// cannot verify. The ones the proxy still needs for dispatch come back
+	// after signing.
+	dispatch := stripHopByHopHeaders(req)
 	// X-Amz-Content-Sha256 is required by S3 and signed when present; setting
 	// it explicitly makes the signed canonical request deterministic across
 	// services.
@@ -362,6 +363,7 @@ func (a *AWSAuth) TransformRequest(ctx context.Context, tctx *transform.Transfor
 			Response: errorResponse(req, http.StatusInternalServerError, "signing_failed"),
 		}, nil
 	}
+	restoreDispatchHeaders(req, dispatch)
 
 	injected := []string{"header:Authorization", "header:X-Amz-Date", "header:X-Amz-Content-Sha256"}
 	if creds.SessionToken != "" {
@@ -521,12 +523,28 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
+// dispatchHeaders are the hop-by-hop headers the proxy itself still reads
+// after the transforms have run: Upgrade and Connection to detect a WebSocket
+// handshake (isWebSocketUpgrade), and Te to keep "Te: trailers" for gRPC
+// (sanitizeUpstreamHeaders). They are left out of the signature but put back
+// afterwards, so the proxy dispatches the request as it would have.
+var dispatchHeaders = []string{"Connection", "Upgrade", "Te"}
+
 // stripHopByHopHeaders removes the headers that will not reach the upstream:
 // every header the Connection header names, then the hop-by-hop set. A client
 // that sends "Connection: close" (Python's urllib always does) would otherwise
 // have it signed, dropped on the way out, and the request refused with
 // SignatureDoesNotMatch.
-func stripHopByHopHeaders(req *http.Request) {
+//
+// It returns the dispatchHeaders it removed. Pass them to
+// restoreDispatchHeaders once the request is signed.
+func stripHopByHopHeaders(req *http.Request) http.Header {
+	kept := http.Header{}
+	for _, name := range dispatchHeaders {
+		if values := req.Header.Values(name); len(values) > 0 {
+			kept[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+		}
+	}
 	for _, value := range req.Header.Values("Connection") {
 		for _, name := range strings.Split(value, ",") {
 			if name = textproto.TrimString(name); name != "" {
@@ -536,6 +554,16 @@ func stripHopByHopHeaders(req *http.Request) {
 	}
 	for _, name := range hopByHopHeaders {
 		req.Header.Del(name)
+	}
+	return kept
+}
+
+// restoreDispatchHeaders puts back the dispatchHeaders stripHopByHopHeaders
+// removed. They are not in SignedHeaders, so the signature is unaffected, and
+// the proxy removes them again before forwarding.
+func restoreDispatchHeaders(req *http.Request, kept http.Header) {
+	for name, values := range kept {
+		req.Header[name] = values
 	}
 }
 
