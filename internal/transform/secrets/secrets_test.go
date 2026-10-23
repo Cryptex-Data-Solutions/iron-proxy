@@ -294,6 +294,61 @@ func TestSecrets_BodySwapAfterAbsentBodySecret(t *testing.T) {
 	require.Equal(t, `{"api_key": "sk-real-openai-key"}`, string(result))
 }
 
+// A match_body secret that misses must leave the body as it found it,
+// including its Truncated and Replaced state. Re-wrapping the bytes would
+// clear both, and a later aws_auth or hmac_sign would then sign a body that
+// was cut off at the limit, or rewritten by an earlier transform, as if it
+// were the client's complete original.
+func TestSecrets_BodyMissKeepsBodyState(t *testing.T) {
+	const body = `{"note": "no placeholder here"}`
+	tests := []struct {
+		name          string
+		limit         int64
+		markReplaced  bool
+		wantTruncated bool
+		wantReplaced  bool
+	}{
+		{name: "truncated body stays truncated", limit: 8, wantTruncated: true},
+		{name: "replaced body stays replaced", limit: 1 << 20, markReplaced: true, wantReplaced: true},
+		{name: "plain body stays plain", limit: 1 << 20},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := makeSecrets(t, []secretEntry{
+				defaultEntry(func(e *secretEntry) {
+					e.Source = envSource("ANTHROPIC_API_KEY")
+					e.ProxyValue = "proxy-anthropic-xyz789"
+					e.MatchHeaders = nil
+					e.MatchBody = true
+				}),
+				defaultEntry(func(e *secretEntry) {
+					e.MatchHeaders = nil
+					e.MatchBody = true
+				}),
+			})
+			req := openaiReq("POST", "/v1/chat")
+			original := transform.NewBufferedBody(io.NopCloser(strings.NewReader(body)), tt.limit)
+			if tt.markReplaced {
+				original.MarkReplaced() // as an earlier credential_mask swap would
+			}
+			req.Body = original
+
+			doTransform(t, s, req)
+
+			got := transform.RequireBufferedBody(req.Body)
+			require.Equal(t, tt.wantTruncated, got.Truncated())
+			require.Equal(t, tt.wantReplaced, got.Replaced())
+			data, err := io.ReadAll(got)
+			require.NoError(t, err)
+			want := body
+			if tt.wantTruncated {
+				want = body[:tt.limit]
+			}
+			require.Equal(t, want, string(data), "the body re-reads from the start")
+		})
+	}
+}
+
 func TestSecrets_HostMatch(t *testing.T) {
 	s := makeSecrets(t, []secretEntry{defaultEntry()})
 

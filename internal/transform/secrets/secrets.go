@@ -582,7 +582,11 @@ func (s *Secrets) swapBody(req *http.Request, sec *resolvedSecret, realValue str
 
 	if !bytes.Contains(data, []byte(sec.proxyValue)) {
 		// Put the body back so the next body-matching secret can read it.
-		req.Body = transform.NewBufferedBodyFromBytes(data)
+		// Rewind the existing body rather than re-wrap the bytes: re-wrapping
+		// would drop its Truncated and Replaced state, which aws_auth and
+		// hmac_sign rely on to refuse a body cut off at the limit or rewritten
+		// by an earlier transform.
+		transform.RewindRequestBody(req, data)
 		return ""
 	}
 
