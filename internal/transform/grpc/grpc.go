@@ -2,6 +2,7 @@
 package grpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -160,7 +161,7 @@ func (g *GRPCTransform) TransformRequest(ctx context.Context, tctx *transform.Tr
 	}
 
 	if resp.GetModifiedRequest() != nil {
-		applyModifiedRequest(resp.GetModifiedRequest(), req)
+		applyModifiedRequest(resp.GetModifiedRequest(), req, pbReq.GetBody(), g.sendRequestBody)
 	}
 
 	return &transform.TransformResult{Action: transform.ActionContinue}, nil
@@ -325,7 +326,14 @@ func protoToHTTPResponse(pb *transformv1.HttpResponse, req *http.Request) *http.
 	return resp
 }
 
-func applyModifiedRequest(pb *transformv1.HttpRequest, req *http.Request) {
+// applyModifiedRequest applies the plugin's modified_request to req. sentBody
+// is the body the plugin was given, and bodySent says whether it was given
+// one at all (send_request_body). A plugin may return a full
+// modified_request that echoes the body unchanged while it edits only
+// headers; that body is kept as the client's, not marked replaced, so a
+// later aws_auth does not refuse an aws-chunked upload whose bytes nobody
+// changed.
+func applyModifiedRequest(pb *transformv1.HttpRequest, req *http.Request, sentBody []byte, bodySent bool) {
 	if pb.GetMethod() != "" {
 		req.Method = pb.GetMethod()
 	}
@@ -339,6 +347,13 @@ func applyModifiedRequest(pb *transformv1.HttpRequest, req *http.Request) {
 	}
 	if len(pb.GetHeaders()) > 0 {
 		req.Header = protoToHeaders(pb.GetHeaders())
+	}
+	if pb.GetBody() != nil && bodySent && bytes.Equal(pb.GetBody(), sentBody) {
+		// The plugin echoed the body byte for byte. Keep the client's body,
+		// with its Truncated and Replaced state, and rewind it for the next
+		// transform.
+		transform.RewindRequestBody(req, sentBody)
+		return
 	}
 	if pb.GetBody() != nil {
 		newBody := transform.NewBufferedBodyFromBytes(pb.GetBody())
