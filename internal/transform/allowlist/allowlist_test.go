@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ironsh/iron-proxy/internal/hostmatch"
 	"github.com/ironsh/iron-proxy/internal/transform"
@@ -420,4 +424,110 @@ func TestMatchPath(t *testing.T) {
 			require.Equal(t, tt.want, hostmatch.MatchPath(tt.pattern, tt.path))
 		})
 	}
+}
+
+// --- domains_file ---
+
+func writeDomainsFile(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "allowlist-temp.txt")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	return path
+}
+
+func TestAllowlist_DomainsFileAddsToInline(t *testing.T) {
+	path := writeDomainsFile(t, "# temporary entries\n\nexample.org\n  *.temp.example.net  \n")
+	a, err := newFromConfig(allowlistConfig{Domains: []string{"api.github.com"}, DomainsFile: path})
+	require.NoError(t, err)
+
+	require.Equal(t, transform.ActionContinue, result(t, a, "api.github.com").Action, "inline domain still allowed")
+	require.Equal(t, transform.ActionContinue, result(t, a, "example.org").Action)
+	require.Equal(t, transform.ActionContinue, result(t, a, "a.temp.example.net").Action)
+	require.Equal(t, transform.ActionContinue, result(t, a, "temp.example.net").Action)
+	require.Equal(t, transform.ActionReject, result(t, a, "evil.com").Action)
+	require.Equal(t, transform.ActionReject, result(t, a, "sub.example.org").Action, "exact entry is not a wildcard")
+}
+
+func TestAllowlist_DomainsFileEmptyAddsNothing(t *testing.T) {
+	path := writeDomainsFile(t, "# nothing yet\n")
+	a, err := newFromConfig(allowlistConfig{Domains: []string{"api.github.com"}, DomainsFile: path})
+	require.NoError(t, err)
+
+	require.Equal(t, transform.ActionContinue, result(t, a, "api.github.com").Action)
+	require.Equal(t, transform.ActionReject, result(t, a, "example.org").Action)
+}
+
+func TestAllowlist_DomainsFileReadAtBuild(t *testing.T) {
+	// The file is read each time the transform is built, which is what a
+	// reload does; an already-built transform does not change.
+	path := writeDomainsFile(t, "example.org\n")
+	before, err := newFromConfig(allowlistConfig{DomainsFile: path})
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(path, []byte("example.net\n"), 0o600))
+	after, err := newFromConfig(allowlistConfig{DomainsFile: path})
+	require.NoError(t, err)
+
+	require.Equal(t, transform.ActionContinue, result(t, before, "example.org").Action)
+	require.Equal(t, transform.ActionReject, result(t, before, "example.net").Action)
+	require.Equal(t, transform.ActionReject, result(t, after, "example.org").Action, "removed entry no longer allowed")
+	require.Equal(t, transform.ActionContinue, result(t, after, "example.net").Action)
+}
+
+func TestAllowlist_DomainsFileRejects(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		wantErr string
+	}{
+		{name: "bare wildcard opens everything", content: "*\n", wantErr: "not a fully qualified hostname"},
+		{name: "wildcard over a single label", content: "*.com\n", wantErr: "at least two labels"},
+		{name: "single-label name", content: "localhost\n", wantErr: "not a fully qualified hostname"},
+		{name: "glob character", content: "exa?ple.com\n", wantErr: "only letters, digits"},
+		{name: "mid-name wildcard", content: "api.*.example.com\n", wantErr: "only letters, digits"},
+		{name: "scheme or path", content: "https://example.com/\n", wantErr: "only letters, digits"},
+		{name: "two entries on one line", content: "example.com example.org\n", wantErr: "one domain per line"},
+		{name: "empty label", content: "example..com\n", wantErr: "empty or over-long label"},
+		{name: "leading hyphen", content: "-example.com\n", wantErr: "cannot start or end with '-'"},
+		{name: "bad line reported with its number", content: "example.org\n\n*\n", wantErr: "line 3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeDomainsFile(t, tt.content)
+			_, err := newFromConfig(allowlistConfig{Domains: []string{"api.github.com"}, DomainsFile: path})
+			require.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestAllowlist_DomainsFileErrors(t *testing.T) {
+	t.Run("missing file", func(t *testing.T) {
+		_, err := newFromConfig(allowlistConfig{DomainsFile: filepath.Join(t.TempDir(), "absent.txt")})
+		require.ErrorContains(t, err, "domains_file")
+		require.ErrorIs(t, err, os.ErrNotExist)
+	})
+	t.Run("relative path", func(t *testing.T) {
+		_, err := newFromConfig(allowlistConfig{DomainsFile: "allowlist-temp.txt"})
+		require.ErrorContains(t, err, "must be an absolute path")
+	})
+	t.Run("directory", func(t *testing.T) {
+		_, err := newFromConfig(allowlistConfig{DomainsFile: t.TempDir()})
+		require.ErrorContains(t, err, "not a regular file")
+	})
+	t.Run("over the size limit", func(t *testing.T) {
+		path := writeDomainsFile(t, strings.Repeat("a", maxDomainsFileBytes+1))
+		_, err := newFromConfig(allowlistConfig{DomainsFile: path})
+		require.ErrorContains(t, err, "byte limit")
+	})
+}
+
+func TestAllowlist_DomainsFileFromYAML(t *testing.T) {
+	path := writeDomainsFile(t, "example.org\n")
+	var node yaml.Node
+	require.NoError(t, yaml.Unmarshal([]byte(fmt.Sprintf("domains: [api.github.com]\ndomains_file: %q\n", path)), &node))
+	tr, err := factory(*node.Content[0], nil)
+	require.NoError(t, err)
+	a := tr.(*Allowlist)
+	require.Equal(t, transform.ActionContinue, result(t, a, "example.org").Action)
+	require.Equal(t, transform.ActionContinue, result(t, a, "api.github.com").Action)
 }
