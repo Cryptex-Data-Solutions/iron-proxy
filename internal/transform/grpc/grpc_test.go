@@ -608,15 +608,63 @@ func TestApplyModifiedRequest_CarriesTruncation(t *testing.T) {
 			req, err := http.NewRequest(http.MethodPost, "https://example.com/x", nil)
 			require.NoError(t, err)
 			original := transform.NewBufferedBody(io.NopCloser(bytes.NewReader([]byte(tt.body))), tt.limit)
-			_, err = io.ReadAll(original) // the body was buffered to send it to the plugin
+			sent, err := io.ReadAll(original) // the body was buffered to send it to the plugin
 			require.NoError(t, err)
 			req.Body = original
 
-			applyModifiedRequest(&transformv1.HttpRequest{Body: []byte("a much longer replacement body from the plugin")}, req)
+			applyModifiedRequest(&transformv1.HttpRequest{Body: []byte("a much longer replacement body from the plugin")}, req, sent, true)
 
 			replaced := transform.RequireBufferedBody(req.Body)
 			require.Equal(t, tt.wantFlag, replaced.Truncated())
 			require.Equal(t, int64(replaced.Len()), req.ContentLength)
+		})
+	}
+}
+
+// A plugin may return a full modified_request that echoes the body byte for
+// byte while it edits only headers. That body is the client's: it must not be
+// marked replaced, or a later aws_auth refuses an aws-chunked upload whose
+// bytes nobody changed (chunked_upload_body_rewritten).
+func TestApplyModifiedRequest_ReplacedOnlyWhenBytesDiffer(t *testing.T) {
+	const clientBody = "10;chunk-signature=x\r\n0123456789abcdef\r\n0\r\n"
+	tests := []struct {
+		name         string
+		returned     []byte
+		bodySent     bool
+		wantReplaced bool
+		wantBody     string
+	}{
+		{name: "echoed unchanged", returned: []byte(clientBody), bodySent: true, wantReplaced: false, wantBody: clientBody},
+		{name: "changed by the plugin", returned: []byte("rewritten"), bodySent: true, wantReplaced: true, wantBody: "rewritten"},
+		{name: "body not sent, plugin supplies one", returned: []byte(clientBody), bodySent: false, wantReplaced: true, wantBody: clientBody},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodPut, "https://bucket.s3.amazonaws.com/key", nil)
+			require.NoError(t, err)
+			original := transform.NewBufferedBody(io.NopCloser(bytes.NewReader([]byte(clientBody))), 0)
+			var sent []byte
+			if tt.bodySent {
+				sent, err = io.ReadAll(original) // buffered to send it to the plugin
+				require.NoError(t, err)
+			}
+			req.Body = original
+			req.ContentLength = int64(len(clientBody))
+
+			applyModifiedRequest(&transformv1.HttpRequest{
+				Headers: map[string]*transformv1.HeaderValues{"X-Plugin": {Values: []string{"1"}}},
+				Body:    tt.returned,
+			}, req, sent, tt.bodySent)
+
+			body := transform.RequireBufferedBody(req.Body)
+			require.Equal(t, tt.wantReplaced, body.Replaced())
+			got, err := io.ReadAll(body)
+			require.NoError(t, err)
+			require.Equal(t, tt.wantBody, string(got), "the next transform reads the body from the start")
+			require.Equal(t, "1", req.Header.Get("X-Plugin"), "header edits still apply")
+			if !tt.wantReplaced {
+				require.Same(t, original, body, "the client's body is kept")
+			}
 		})
 	}
 }
