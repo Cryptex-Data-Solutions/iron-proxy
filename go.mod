@@ -2,6 +2,8 @@ module github.com/ironsh/iron-proxy
 
 go 1.26.1
 
+toolchain go1.27.3
+
 require (
 	github.com/1Password/connect-sdk-go v1.5.3
 	github.com/1password/onepassword-sdk-go v0.4.0
