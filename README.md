@@ -279,6 +279,34 @@ log:
   level: "info" # debug, info, warn, error
 ```
 
+### Allowlist entries from a file
+
+`domains_file` adds domains from a separate file to the allowlist. That lets
+another process (for example a UI for temporary entries) own the extra list,
+while the config file stays with whatever deploys it:
+
+```yaml
+transforms:
+  - name: allowlist
+    config:
+      domains: ["api.openai.com"]
+      domains_file: "/var/lib/iron-proxy/allowlist-temp.txt"
+```
+
+- **When it's read:** at startup and on every `POST /v1/reload`. A change
+  takes effect on the next reload.
+- **What the file adds:** its domains are added to the inline ones; they
+  never narrow them.
+- **Format:** one domain per line, either an exact hostname or `*.` over a
+  name with at least two labels. Blank lines and `#` comments are ignored.
+- **Stricter than inline `domains`:** a bare `*`, `*.com`, and any other glob
+  character are refused, so one bad line can't open the allowlist wide.
+- **Errors:** a missing file, an invalid entry, or a file over 1 MiB is an
+  error.
+  - At startup, the proxy doesn't start.
+  - On reload, the reload is refused with `422` and the running allowlist is
+    kept.
+
 ### DNS
 
 Everything resolves to `proxy_ip` by default, which is what routes traffic
