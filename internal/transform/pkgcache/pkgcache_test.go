@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -470,4 +472,68 @@ func TestConfig_Validation(t *testing.T) {
 		{Prefix: "npm/", Rules: []hostmatch.RuleConfig{{Host: "registry.yarnpkg.com", Paths: []string{"/*/-/*.tgz"}}}},
 	}}, st, nil)
 	require.ErrorContains(t, err, "used twice")
+}
+
+// smallReads hands out at most n bytes per Read, like a slow network.
+type smallReads struct {
+	r io.Reader
+	n int
+}
+
+func (s *smallReads) Read(p []byte) (int, error) {
+	if len(p) > s.n {
+		p = p[:s.n]
+	}
+	return s.r.Read(p)
+}
+
+func TestUploadTimeout_StopsADirectoryUpload(t *testing.T) {
+	root := t.TempDir()
+	st, err := newDirStore(root)
+	require.NoError(t, err)
+	c := testConfig()
+	c.UploadTimeout = 100 * time.Millisecond
+	c.UploadIdleTimeout = 10 * time.Second // the client never goes idle
+	p := newTestCache(t, c, st)
+
+	req := newRequest("GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz")
+	payload := bytes.Repeat([]byte("z"), 40_000)
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{},
+		ContentLength: int64(len(payload)),
+		Body:          transform.NewBufferedBody(io.NopCloser(&smallReads{r: bytes.NewReader(payload), n: 1000}), 0),
+		Request:       req,
+	}
+	runResponse(t, p, req, resp)
+
+	// The client trickles for well past upload_timeout, without ever
+	// pausing long enough for the idle timeout.
+	reader := transform.RequireBufferedBody(resp.Body).StreamingReader()
+	var got []byte
+	buf := make([]byte, 1000)
+	for i := 0; i < 20; i++ {
+		n, err := reader.Read(buf)
+		got = append(got, buf[:n]...)
+		require.NoError(t, err)
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// The upload gave up at its deadline and freed its slot...
+	require.Eventually(t, func() bool { return len(p.uploads) == 0 }, 2*time.Second, 5*time.Millisecond)
+
+	// ...the client still gets every byte...
+	rest, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, payload, append(got, rest...))
+
+	// ...and nothing was stored, not even a temporary file.
+	var files []string
+	require.NoError(t, filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			files = append(files, path)
+		}
+		return err
+	}))
+	require.Empty(t, files)
 }

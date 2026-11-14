@@ -59,6 +59,14 @@ type uploadSettings struct {
 func startUpload(src io.ReadCloser, key string, size int64, contentType string, st store, settings uploadSettings, logger *slog.Logger, release func()) *uploadingBody {
 	pipeReader, pipeWriter := io.Pipe()
 	ctx, cancel := context.WithTimeout(context.Background(), settings.uploadTimeout)
+	// When the upload's time is up, close the pipe the store reads from. A
+	// store that doesn't watch its context (the directory store's io.Copy)
+	// is then unblocked too, instead of holding the upload slot for as long
+	// as a slow client keeps trickling bytes. After a normal finish this
+	// closes an already-finished pipe, which does nothing.
+	context.AfterFunc(ctx, func() {
+		_ = pipeReader.CloseWithError(fmt.Errorf("pkgcache: upload stopped: %w", ctx.Err()))
+	})
 
 	b := &uploadingBody{
 		src:        src,
