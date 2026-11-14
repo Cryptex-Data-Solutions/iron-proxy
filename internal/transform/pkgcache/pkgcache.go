@@ -11,15 +11,23 @@
 // to the registry exactly as it would without the cache. A broken cache makes
 // installs slower, never failing.
 //
-// Only immutable, public files are cached: GET requests with no Authorization
-// or Cookie header, no Range header and no query string, whose host and path
-// match one of the configured caches. Version lists and other metadata change
-// all the time and must not match the configured paths.
+// Only immutable files are cached: HTTPS GET requests on port 443 with no
+// Cookie or Range header, no query string and a path no transform rewrote,
+// whose host and path match one of the configured caches. Version lists and
+// other metadata change all the time and must not match the configured
+// paths.
+//
+// Credentials don't stop a file being cached: a request with an
+// Authorization header, or one a transform injected a credential into, is
+// cached like any other, and a hit is served without checking credentials.
+// iron-proxy rules can't be scoped to a client, so any client of the proxy
+// can already get an injected credential applied; but a file fetched with a
+// client's own key is then served to clients without it. Only configure
+// caches for registries where that's acceptable.
 //
 // The registries' hosts must be decrypted (tls.intercept) for the transform
 // to see their requests. List this transform last in transforms:, so it sees
-// each request after every other transform, including any credential a
-// secrets transform added (which makes the request uncacheable).
+// each request after every other transform (and so after any path rewrite).
 //
 // Storage is either S3 (bucket, with optional region, endpoint and
 // use_path_style for S3-compatible services) or a local directory
@@ -49,7 +57,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"strconv"
 	"strings"
@@ -240,14 +250,31 @@ func (p *PkgCache) cacheKey(req *http.Request) (string, string) {
 	if req.Method != http.MethodGet {
 		return "", "not a GET"
 	}
-	if req.Header.Get("Authorization") != "" || req.Header.Get("Cookie") != "" {
-		return "", "has credentials"
+	// Only the registry itself, over verified TLS, may fill the cache: a
+	// plain-HTTP response or another port on the same host would otherwise
+	// share the HTTPS keys and be served as if the registry had sent it.
+	if req.TLS == nil {
+		return "", "not HTTPS"
+	}
+	if !onDefaultHTTPSPort(req.Host) {
+		return "", "not port 443"
+	}
+	// Session state, not a package credential; registries don't use it.
+	if req.Header.Get("Cookie") != "" {
+		return "", "has a cookie"
 	}
 	if req.Header.Get("Range") != "" {
 		return "", "range request"
 	}
 	if req.URL.RawQuery != "" {
 		return "", "has a query string"
+	}
+	// A transform rewrote the path (e.g. secrets swapping a token into the
+	// URL). The path may now hold a real credential, which must never become
+	// a store key or a log line, and the key would change every time the
+	// token rotates anyway.
+	if pathRewritten(req) {
+		return "", "path rewritten by a transform"
 	}
 	for _, c := range p.caches {
 		if !hostmatch.MatchAnyRule(c.rules, req) {
@@ -265,6 +292,31 @@ func (p *PkgCache) cacheKey(req *http.Request) (string, string) {
 		return key, ""
 	}
 	return "", "no cache matches"
+}
+
+// onDefaultHTTPSPort reports whether host (a Host header) names port 443,
+// explicitly or by leaving the port out.
+func onDefaultHTTPSPort(host string) bool {
+	_, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return true // no port in the Host header: the default
+	}
+	return port == "443"
+}
+
+// pathRewritten reports whether the request's path differs from the one the
+// client sent. RequestURI is the client's request line and never changes;
+// req.URL is what transforms edit. An unreadable or missing RequestURI
+// counts as rewritten, so the request isn't cached.
+func pathRewritten(req *http.Request) bool {
+	if req.RequestURI == "" {
+		return true
+	}
+	original, err := url.ParseRequestURI(req.RequestURI)
+	if err != nil {
+		return true
+	}
+	return original.EscapedPath() != req.URL.EscapedPath()
 }
 
 // TransformRequest answers a cacheable request from the store when it can.

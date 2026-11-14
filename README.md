@@ -678,11 +678,21 @@ slows the client: if storage falls behind, that copy is dropped. Only
 complete files are stored (status 200, the full `Content-Length`, no
 `Content-Encoding`).
 
-Only public, immutable files are cached: `GET` requests with no
-`Authorization`, `Cookie` or `Range` header and no query string, whose host
-and path match a configured cache. Each rule must list `paths` matching only
-package files; version lists and other metadata change all the time and
-always pass through.
+Only immutable files are cached: HTTPS `GET` requests on port 443 with no
+`Cookie` or `Range` header, no query string and a path no transform
+rewrote, whose host and path match a configured cache. Each rule must list
+`paths` matching only package files; version lists and other metadata
+change all the time and always pass through. A request whose path a
+transform rewrote (for example `secrets` with `replace.match_path`) is never
+cached, so a credential in a URL never becomes a storage key or a log line.
+
+Credentials don't stop a file being cached. A request with an
+`Authorization` header, or one another transform injected a credential
+into, is cached like any other, and a hit is served without checking
+credentials. iron-proxy rules can't be scoped to a client, so any client can
+already get an injected credential applied; but a file fetched with a
+client's own key is then served to clients without that key. Only configure
+caches for registries where that's acceptable.
 
 Storage is an S3 bucket (`bucket`, optional `region`; `endpoint` and
 `use_path_style` for S3-compatible services such as MinIO or R2) or a local
@@ -704,8 +714,8 @@ Audit output: `pkgcache` is `hit`, `miss` or `lookup_error` on the request,
 and `pkgcache_store` is `started` or `skipped: <reason>` on a miss. Hits also
 carry an `X-Iron-Pkgcache: hit` response header.
 
-> **Placement:** put `pkgcache` *last*, after `secrets`, so a request that
-> had a credential injected is never cached or answered from the cache.
+> **Placement:** put `pkgcache` *last*, after `secrets`, so it sees each
+> request after every other transform, including any path rewrite.
 
 ```yaml
 transforms:

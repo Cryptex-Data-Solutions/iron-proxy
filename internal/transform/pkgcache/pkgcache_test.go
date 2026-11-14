@@ -192,8 +192,12 @@ func TestCacheKey(t *testing.T) {
 		{"POST", "POST", "https://registry.npmjs.org/react/-/react-18.3.1.tgz", nil, ""},
 		{"HEAD", "HEAD", "https://registry.npmjs.org/react/-/react-18.3.1.tgz", nil, ""},
 		{"query string", "GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz?x=1", nil, ""},
-		{"authorization", "GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
-			map[string]string{"Authorization": "Bearer secret"}, ""},
+		{"client's own credential (still cached)", "GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
+			map[string]string{"Authorization": "Bearer secret"}, "npm/registry.npmjs.org/react/-/react-18.3.1.tgz"},
+		{"explicit port 443", "GET", "https://registry.npmjs.org:443/react/-/react-18.3.1.tgz", nil,
+			"npm/registry.npmjs.org/react/-/react-18.3.1.tgz"},
+		{"plain HTTP", "GET", "http://registry.npmjs.org/react/-/react-18.3.1.tgz", nil, ""},
+		{"another port", "GET", "https://registry.npmjs.org:8443/react/-/react-18.3.1.tgz", nil, ""},
 		{"cookie", "GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
 			map[string]string{"Cookie": "a=b"}, ""},
 		{"range", "GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
@@ -209,6 +213,38 @@ func TestCacheKey(t *testing.T) {
 			require.Equal(t, tc.wantKey, key)
 		})
 	}
+}
+
+func TestCacheKey_PathRewrittenByATransform(t *testing.T) {
+	p := newTestCache(t, testConfig(), newMemStore())
+	req := newRequest("GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz")
+	// As the secrets transform does with replace.match_path: the client's
+	// placeholder becomes a real token in the path.
+	req.URL.Path = "/react/-/react-18.3.1-real-token.tgz"
+
+	key, reason := p.cacheKey(req)
+	require.Empty(t, key, "a rewritten path may hold a secret: never a key")
+	require.Equal(t, "path rewritten by a transform", reason)
+
+	res, ann := runRequest(t, p, req)
+	require.Equal(t, transform.ActionContinue, res.Action)
+	require.Nil(t, ann, "not ours: nothing annotated, nothing logged")
+}
+
+func TestCacheKey_InjectedCredentialStillCached(t *testing.T) {
+	st := newMemStore()
+	key := "npm/registry.npmjs.org/@private/pkg/-/pkg-1.0.0.tgz"
+	st.objects[key] = []byte("private tarball")
+	p := newTestCache(t, testConfig(), st)
+
+	req := newRequest("GET", "https://registry.npmjs.org/@private/pkg/-/pkg-1.0.0.tgz")
+	req.Header.Set("X-Registry-Token", "injected")
+	tctx := &transform.TransformContext{}
+	tctx.MarkCredentialInjected("secrets")
+
+	res, err := p.TransformRequest(context.Background(), tctx, req)
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionStub, res.Action)
 }
 
 func TestHit_ServedFromStore(t *testing.T) {
