@@ -663,6 +663,77 @@ trace, including `judge.instance`, `judge.decision`, `judge.reason`,
 Credits: thanks to Brex for their CrabTrap project (MIT-licensed), which
 informed this design.
 
+### Package cache
+
+Read-through cache for package files (npm tarballs, NuGet `.nupkg` files and
+the like). A request for a cached file is answered from the cache, and the
+registry is never contacted; the audit log records it as `stub`. On a miss
+the request goes to the registry as normal, and the response is copied into
+the cache while it streams to the client. The cache fills itself from real
+traffic: nothing to pre-load, and no client configuration.
+
+It fails open. Any storage error or timeout sends the request to the
+registry as if the cache weren't there, and the copy into the cache never
+slows the client: if storage falls behind, that copy is dropped. Only
+complete files are stored (status 200, the full `Content-Length`, no
+`Content-Encoding`).
+
+Only immutable files are cached: HTTPS `GET` requests on port 443 with no
+`Cookie` or `Range` header, no query string, no encoded characters in the
+path (`%2F` and the like) and a path no transform rewrote, whose host and path match a configured cache. Each rule must list
+`paths` matching only package files; version lists and other metadata
+change all the time and always pass through. A request whose path a
+transform rewrote (for example `secrets` with `replace.match_path`) is never
+cached, so a credential in a URL never becomes a storage key or a log line.
+
+Credentials don't stop a file being cached. A request with an
+`Authorization` header, or one another transform injected a credential
+into, is cached like any other, and a hit is served without checking
+credentials. iron-proxy rules can't be scoped to a client, so any client can
+already get an injected credential applied; but a file fetched with a
+client's own key is then served to clients without that key. Only configure
+caches for registries where that's acceptable.
+
+Storage is an S3 bucket (`bucket`, optional `region`; `endpoint` and
+`use_path_style` for S3-compatible services such as MinIO or R2) or a local
+directory (`directory`). Keys are `<prefix>/<host><path>`. The transform
+never deletes anything: expire objects with an S3 lifecycle rule, or with a
+cron job for a directory. The S3 role needs `s3:GetObject`, `s3:PutObject`
+and `s3:ListBucket` (without `ListBucket`, a missing key returns 403 and is
+treated as an error).
+
+Optional settings, with their defaults: `lookup_timeout` (2s),
+`hit_read_timeout` (10m), `upload_timeout` (10m), `upload_idle_timeout`
+(60s), `max_object_bytes` (1 GiB), `max_queued_bytes` per upload (8 MiB),
+`max_concurrent_uploads` (32).
+
+The registries' hosts must be decrypted (`tls.intercept`) for the transform
+to see their requests.
+
+Audit output: `pkgcache` is `hit`, `miss` or `lookup_error` on the request,
+and `pkgcache_store` is `started` or `skipped: <reason>` on a miss. Hits also
+carry an `X-Iron-Pkgcache: hit` response header.
+
+> **Placement:** put `pkgcache` *last*, after `secrets`, so it sees each
+> request after every other transform, including any path rewrite.
+
+```yaml
+transforms:
+  - name: pkgcache
+    config:
+      bucket: "example-pkgcache"
+      region: "af-south-1"
+      caches:
+        - prefix: "npm"
+          rules:
+            - host: "registry.npmjs.org"
+              paths: ["/*/-/*.tgz", "/@*/*/-/*.tgz"]
+        - prefix: "nuget"
+          rules:
+            - host: "api.nuget.org"
+              paths: ["/v3-flatcontainer/*/*/*.nupkg"]
+```
+
 ## MCP policy
 
 iron-proxy can speak [MCP's Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports). When a request matches a configured MCP server, the proxy parses the JSON-RPC body, applies a default-deny tool allowlist, and filters `tools/list` responses so denied tools never reach the agent. SSE responses are filtered per event so long-lived MCP streams stay live.
