@@ -12,7 +12,8 @@
 // installs slower, never failing.
 //
 // Only immutable files are cached: HTTPS GET requests on port 443 with no
-// Cookie or Range header, no query string and a path no transform rewrote,
+// Cookie or Range header, no query string, no encoded characters in the
+// path, and a path no transform rewrote,
 // whose host and path match one of the configured caches. Version lists and
 // other metadata change all the time and must not match the configured
 // paths.
@@ -63,6 +64,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -276,6 +278,12 @@ func (p *PkgCache) cacheKey(req *http.Request) (string, string) {
 	if pathRewritten(req) {
 		return "", "path rewritten by a transform"
 	}
+	// Encoded characters (e.g. %2F) are forwarded encoded, so /a%2Fb and
+	// /a/b are different files upstream but would share a decoded key.
+	// Package file URLs (npm tarballs, NuGet .nupkg) never have them.
+	if req.URL.RawPath != "" {
+		return "", "encoded characters in the path"
+	}
 	for _, c := range p.caches {
 		if !hostmatch.MatchAnyRule(c.rules, req) {
 			continue
@@ -320,7 +328,7 @@ func pathRewritten(req *http.Request) bool {
 }
 
 // TransformRequest answers a cacheable request from the store when it can.
-func (p *PkgCache) TransformRequest(_ context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
+func (p *PkgCache) TransformRequest(ctx context.Context, tctx *transform.TransformContext, req *http.Request) (*transform.TransformResult, error) {
 	cont := &transform.TransformResult{Action: transform.ActionContinue}
 
 	key, _ := p.cacheKey(req)
@@ -328,7 +336,7 @@ func (p *PkgCache) TransformRequest(_ context.Context, tctx *transform.Transform
 		return cont, nil // not ours: no annotation, to keep the audit quiet
 	}
 
-	obj, err := p.lookup(key)
+	obj, err := p.lookup(ctx, key)
 	if errors.Is(err, errNotFound) {
 		tctx.Annotate("pkgcache", "miss")
 		return cont, nil
@@ -370,11 +378,13 @@ func (p *PkgCache) TransformRequest(_ context.Context, tctx *transform.Transform
 // lookup gets key from the store. LookupTimeout bounds the wait for the
 // store to answer; HitReadTimeout bounds streaming the whole object.
 //
-// The proxy never calls Close on a stubbed response's body, so the returned
-// body closes itself at the end of the stream, and the read timeout frees the
-// connection if the client stops reading part way.
-func (p *PkgCache) lookup(key string) (*object, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), p.cfg.HitReadTimeout)
+// The proxy never calls Close on a stubbed response's body. So the returned
+// body closes itself at the end of the stream, and also as soon as the
+// request's context ends: Go cancels it when the proxy's handler returns,
+// whether the copy finished or the client went away. That frees the S3
+// connection or the open file straight away, not at HitReadTimeout.
+func (p *PkgCache) lookup(requestCtx context.Context, key string) (*object, error) {
+	ctx, cancel := context.WithTimeout(requestCtx, p.cfg.HitReadTimeout)
 	lookupTimer := time.AfterFunc(p.cfg.LookupTimeout, cancel)
 	obj, err := p.store.Get(ctx, key)
 	timedOut := !lookupTimer.Stop()
@@ -392,7 +402,9 @@ func (p *PkgCache) lookup(key string) (*object, error) {
 		cancel()
 		return nil, fmt.Errorf("pkgcache: lookup took longer than %s", p.cfg.LookupTimeout)
 	}
-	obj.Body = &selfClosingBody{body: obj.Body, cancel: cancel}
+	body := &selfClosingBody{body: obj.Body, cancel: cancel}
+	context.AfterFunc(ctx, func() { body.Close() })
+	obj.Body = body
 	return obj, nil
 }
 
@@ -464,11 +476,15 @@ func (p *PkgCache) storeSkipReason(resp *http.Response) string {
 }
 
 // selfClosingBody closes the store's body (and cancels its context) at the
-// end of the stream or on a read error, since nothing else will.
+// end of the stream, on a read error, or when the request ends, since
+// nothing else will. Close can run on another goroutine (context.AfterFunc)
+// while a Read is in progress; closing a file or an HTTP body is safe then,
+// and the Read just returns an error.
 type selfClosingBody struct {
-	body   io.ReadCloser
-	cancel context.CancelFunc
-	closed bool
+	body      io.ReadCloser
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (s *selfClosingBody) Read(p []byte) (int, error) {
@@ -480,11 +496,9 @@ func (s *selfClosingBody) Read(p []byte) (int, error) {
 }
 
 func (s *selfClosingBody) Close() error {
-	if s.closed {
-		return nil
-	}
-	s.closed = true
-	err := s.body.Close()
-	s.cancel()
-	return err
+	s.closeOnce.Do(func() {
+		s.closeErr = s.body.Close()
+		s.cancel()
+	})
+	return s.closeErr
 }

@@ -679,8 +679,8 @@ complete files are stored (status 200, the full `Content-Length`, no
 `Content-Encoding`).
 
 Only immutable files are cached: HTTPS `GET` requests on port 443 with no
-`Cookie` or `Range` header, no query string and a path no transform
-rewrote, whose host and path match a configured cache. Each rule must list
+`Cookie` or `Range` header, no query string, no encoded characters in the
+path (`%2F` and the like) and a path no transform rewrote, whose host and path match a configured cache. Each rule must list
 `paths` matching only package files; version lists and other metadata
 change all the time and always pass through. A request whose path a
 transform rewrote (for example `secrets` with `replace.match_path`) is never

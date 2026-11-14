@@ -196,6 +196,7 @@ func TestCacheKey(t *testing.T) {
 			map[string]string{"Authorization": "Bearer secret"}, "npm/registry.npmjs.org/react/-/react-18.3.1.tgz"},
 		{"explicit port 443", "GET", "https://registry.npmjs.org:443/react/-/react-18.3.1.tgz", nil,
 			"npm/registry.npmjs.org/react/-/react-18.3.1.tgz"},
+		{"encoded slash", "GET", "https://registry.npmjs.org/@babel%2fcore/-/core-7.26.0.tgz", nil, ""},
 		{"plain HTTP", "GET", "http://registry.npmjs.org/react/-/react-18.3.1.tgz", nil, ""},
 		{"another port", "GET", "https://registry.npmjs.org:8443/react/-/react-18.3.1.tgz", nil, ""},
 		{"cookie", "GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz",
@@ -269,6 +270,23 @@ func TestHit_ServedFromStore(t *testing.T) {
 	require.Equal(t, "tarball bytes", string(data))
 	_, _, closed := st.counts()
 	require.Equal(t, 1, closed)
+}
+
+func TestHit_BodyClosedWhenRequestEnds(t *testing.T) {
+	st := newMemStore()
+	key := "npm/registry.npmjs.org/react/-/react-18.3.1.tgz"
+	st.objects[key] = []byte("tarball bytes")
+	p := newTestCache(t, testConfig(), st)
+
+	// The client goes away before reading anything: the proxy never closes
+	// the body, but the request's context ends.
+	ctx, endRequest := context.WithCancel(context.Background())
+	res, err := p.TransformRequest(ctx, &transform.TransformContext{}, newRequest("GET", "https://registry.npmjs.org/react/-/react-18.3.1.tgz"))
+	require.NoError(t, err)
+	require.Equal(t, transform.ActionStub, res.Action)
+
+	endRequest()
+	require.Eventually(t, func() bool { _, _, closed := st.counts(); return closed == 1 }, 2*time.Second, 5*time.Millisecond)
 }
 
 func TestMiss_StoredWhileStreaming(t *testing.T) {
