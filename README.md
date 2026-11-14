@@ -676,7 +676,9 @@ It fails open. Any storage error or timeout sends the request to the
 registry as if the cache weren't there, and the copy into the cache never
 slows the client: if storage falls behind, that copy is dropped. Only
 complete files are stored (status 200, the full `Content-Length`, no
-`Content-Encoding`).
+`Content-Encoding`, no `Cache-Control: private`/`no-store`). Only the body
+and its content type are kept: response headers, such as the
+bot-management `Set-Cookie` a CDN adds, are never replayed on a hit.
 
 Only immutable files are cached: HTTPS `GET` requests on port 443 with no
 `Cookie` or `Range` header, no query string, no encoded characters in the

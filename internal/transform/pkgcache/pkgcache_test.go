@@ -416,7 +416,6 @@ func TestResponsesThatMustNotBeStored(t *testing.T) {
 		{"compressed", func(r *http.Response) { r.Header.Set("Content-Encoding", "gzip") }, "skipped: content-encoding gzip"},
 		{"no length", func(r *http.Response) { r.ContentLength = -1 }, "skipped: no Content-Length"},
 		{"private", func(r *http.Response) { r.Header.Set("Cache-Control", "private, max-age=0") }, "skipped: Cache-Control private, max-age=0"},
-		{"sets cookie", func(r *http.Response) { r.Header.Set("Set-Cookie", "a=b") }, "skipped: sets a cookie"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,6 +432,28 @@ func TestResponsesThatMustNotBeStored(t *testing.T) {
 			require.Equal(t, 0, puts)
 		})
 	}
+}
+
+// registry.npmjs.org (behind Cloudflare) sets a bot-management cookie on
+// every response, tarballs included. The file is still stored, and a hit
+// never replays the cookie.
+func TestSetCookie_StoredWithoutTheCookie(t *testing.T) {
+	st := newMemStore()
+	p := newTestCache(t, testConfig(), st)
+	req := newRequest("GET", "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz")
+	resp := upstreamResponse(req, []byte("tarball"), 7)
+	resp.Header.Set("Set-Cookie", "__cf_bm=abc; path=/; HttpOnly")
+
+	ann := runResponse(t, p, req, resp)
+	require.Equal(t, "started", ann["pkgcache_store"])
+	require.Equal(t, "tarball", string(clientReads(t, resp)))
+
+	key := "npm/registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+	require.Eventually(t, func() bool { _, ok := st.stored(key); return ok }, 2*time.Second, 5*time.Millisecond)
+
+	res, _ := runRequest(t, p, newRequest("GET", "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"))
+	require.Equal(t, transform.ActionStub, res.Action)
+	require.Empty(t, res.Response.Header.Get("Set-Cookie"), "a hit never carries the registry's cookie")
 }
 
 func TestTooManyUploads_Skipped(t *testing.T) {

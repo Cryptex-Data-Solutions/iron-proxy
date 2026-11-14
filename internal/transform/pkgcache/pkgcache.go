@@ -454,6 +454,13 @@ func (p *PkgCache) TransformResponse(_ context.Context, tctx *transform.Transfor
 }
 
 // storeSkipReason says why resp mustn't be stored, or "" when it may be.
+//
+// Set-Cookie is deliberately not a reason: CDNs in front of registries
+// (Cloudflare on registry.npmjs.org) add a bot-management cookie to every
+// response, tarballs included. Only the body and its content type are
+// stored, never response headers, so a cookie is never replayed to another
+// client. Cache-Control private or no-store is the real "this response is
+// personal" signal.
 func (p *PkgCache) storeSkipReason(resp *http.Response) string {
 	switch {
 	case resp.StatusCode != http.StatusOK:
@@ -469,8 +476,6 @@ func (p *PkgCache) storeSkipReason(resp *http.Response) string {
 	case strings.Contains(strings.ToLower(resp.Header.Get("Cache-Control")), "private"),
 		strings.Contains(strings.ToLower(resp.Header.Get("Cache-Control")), "no-store"):
 		return "Cache-Control " + resp.Header.Get("Cache-Control")
-	case resp.Header.Get("Set-Cookie") != "":
-		return "sets a cookie"
 	}
 	return ""
 }
